@@ -15,11 +15,11 @@
 // ---------------------------------------------------------------------------
 
 __global__ void rmsnorm_kernel(
-    half*       out,
-    const half* x,
-    const half* weight,
-    int         cols,
-    float       eps
+    half*        out,
+    const half*  x,
+    const float* weight,
+    int          cols,
+    float        eps
 ) {
     extern __shared__ float smem[];   // n_warps floats
 
@@ -66,7 +66,7 @@ __global__ void rmsnorm_kernel(
     // ------------------------------------------------------------------
     for (int i = tid; i < cols; i += blockDim.x) {
         float xi = __half2float(x_row[i]);
-        float wi = __half2float(weight[i]);
+        float wi = weight[i];
         o_row[i] = __float2half(xi * rms_inv * wi);
     }
 }
@@ -75,9 +75,9 @@ __global__ void rmsnorm_kernel(
 // Launch wrapper
 // ---------------------------------------------------------------------------
 void launch_rmsnorm(
-    half*        out,
-    const half*  x,
-    const half*  weight,
+    half*         out,
+    const half*   x,
+    const float*  weight,
     int          rows,
     int          cols,
     float        eps,

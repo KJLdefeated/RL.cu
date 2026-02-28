@@ -46,12 +46,15 @@ $(BUILDDIR)/test_rope: src/kernels/rope.cu tests/test_rope.cu | $(BUILDDIR)
 $(BUILDDIR)/test_embedding: src/kernels/embedding.cu tests/test_embedding.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@
 
+$(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding tests generate_refs clean
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_loading_weights tests generate_refs clean
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -74,7 +77,10 @@ test_rope: $(BUILDDIR)/test_rope
 test_embedding: $(BUILDDIR)/test_embedding
 	./$(BUILDDIR)/test_embedding
 
-tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding
+test_loading_weights: $(BUILDDIR)/test_loading_weights
+	./$(BUILDDIR)/test_loading_weights
+
+tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_loading_weights
 
 # ── PyTorch reference generator ───────────────────────────────────────────────
 

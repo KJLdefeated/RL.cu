@@ -69,30 +69,27 @@ static bool run_test(const char* name, int rows, int cols, float eps = 1e-5f) {
     float* h_ref   = new float[N];
 
     half*  h_x   = new half[N];
-    half*  h_w   = new half[cols];
     half*  h_out = new half[N];
 
     for (int i = 0; i < N;    ++i) h_x_f32[i] = lcg_randf();
     for (int i = 0; i < cols; ++i) h_w_f32[i] = lcg_randf() * 0.5f + 1.0f; // near 1
 
-    for (int i = 0; i < N;    ++i) h_x[i] = __float2half(h_x_f32[i]);
-    for (int i = 0; i < cols; ++i) h_w[i] = __float2half(h_w_f32[i]);
+    for (int i = 0; i < N; ++i) h_x[i] = __float2half(h_x_f32[i]);
 
-    // Reference must use the FP16-quantised values (round-trip back to FP32)
-    // so the comparison is kernel(fp16_input) vs ref(same_fp16_input_as_fp32).
-    for (int i = 0; i < N;    ++i) h_x_f32[i] = __half2float(h_x[i]);
-    for (int i = 0; i < cols; ++i) h_w_f32[i] = __half2float(h_w[i]);
+    // Reference: x round-trips through FP16 (kernel input), weight stays FP32
+    for (int i = 0; i < N; ++i) h_x_f32[i] = __half2float(h_x[i]);
 
     ref_rmsnorm(h_ref, h_x_f32, h_w_f32, rows, cols, eps);
 
     // --- device buffers ---
-    half *d_x, *d_w, *d_out;
+    half  *d_x, *d_out;
+    float *d_w;
     CUDA_CHECK(cudaMalloc(&d_x,   N    * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_w,   cols * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_w,   cols * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, N    * sizeof(half)));
 
-    CUDA_CHECK(cudaMemcpy(d_x, h_x, N    * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, h_w, cols * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_x, h_x,     N    * sizeof(half),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w, h_w_f32, cols * sizeof(float), cudaMemcpyHostToDevice));
 
     launch_rmsnorm(d_out, d_x, d_w, rows, cols, eps);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -113,7 +110,7 @@ static bool run_test(const char* name, int rows, int cols, float eps = 1e-5f) {
 
     cudaFree(d_x); cudaFree(d_w); cudaFree(d_out);
     delete[] h_x_f32; delete[] h_w_f32; delete[] h_ref;
-    delete[] h_x;    delete[] h_w;    delete[] h_out;
+    delete[] h_x; delete[] h_out;
 
     return passed;
 }
@@ -127,9 +124,10 @@ static void run_benchmark(const char* name, int rows, int cols,
                           float eps = 1e-5f,
                           int warmup = 10, int iters = 200) {
     const int N = rows * cols;
-    half *d_x, *d_w, *d_out;
+    half  *d_x, *d_out;
+    float *d_w;
     CUDA_CHECK(cudaMalloc(&d_x,   N    * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_w,   cols * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_w,   cols * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, N    * sizeof(half)));
 
     cudaEvent_t ev_start, ev_stop;
@@ -149,7 +147,8 @@ static void run_benchmark(const char* name, int rows, int cols,
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
     const float us    = ms * 1000.0f / iters;
-    const float bytes = (float)(2 * N + cols) * sizeof(half);
+    // x (half) + out (half) + weight (float)
+    const float bytes = (float)(2 * N) * sizeof(half) + (float)cols * sizeof(float);
     const float bw_gb = bytes / (us * 1e-6f) / 1e9f;
 
     printf("[BENCH] %-44s  %7.2f us  %6.1f GB/s\n", name, us, bw_gb);

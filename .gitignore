@@ -1,3 +1,9 @@
 # C build
 build/
 .claude/
+
+# Model weights
+model_weights/
+
+# Third-party libraries
+include/third_party/
