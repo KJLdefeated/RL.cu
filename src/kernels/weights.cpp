@@ -276,6 +276,12 @@ Qwen3Weights load_weights(const std::string& model_dir, const Qwen3Config& cfg) 
     // --- Upload global tensors ---
     size_t embed_elems = (size_t)cfg.vocab_size * cfg.hidden_size;
     w.embed_tokens = upload_tensor("model.embed_tokens.weight", embed_elems);
+    if (cfg.tie_word_embeddings) {
+        // Weights are identical by construction — share the GPU pointer, save ~311 MB.
+        w.lm_head = w.embed_tokens;
+    } else {
+        w.lm_head = upload_tensor("lm_head.weight", embed_elems);
+    }
     w.final_norm   = upload_tensor_fp32("model.norm.weight", cfg.hidden_size);
 
     // --- Upload per-layer tensors ---
@@ -320,6 +326,10 @@ void free_weights(Qwen3Weights& w) {
     };
 
     safe_free(w.embed_tokens);
+    // lm_head is either an alias of embed_tokens (tied) or an independent allocation.
+    // Only free it when it's independent; the embed_tokens free above handles the tied case.
+    if (w.lm_head != nullptr && w.lm_head != w.embed_tokens)
+        safe_free(w.lm_head);
     safe_free(w.final_norm);
 
     for (auto& L : w.layers) {

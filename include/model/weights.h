@@ -8,6 +8,7 @@
 //
 // Safetensors tensor name patterns for Qwen3:
 //   model.embed_tokens.weight                         [vocab_size, hidden_size]
+//   lm_head.weight                                    tied to embed_tokens (tie_word_embeddings=true)
 //   model.layers.{i}.input_layernorm.weight           [hidden_size]
 //   model.layers.{i}.self_attn.q_proj.weight          [q_dim, hidden_size]
 //   model.layers.{i}.self_attn.k_proj.weight          [kv_dim, hidden_size]
@@ -36,7 +37,8 @@ struct Qwen3LayerWeights {
 };
 
 struct Qwen3Weights {
-    half*  embed_tokens;         // [vocab_size, hidden_size]  (tied with lm_head)
+    half*  embed_tokens;         // [vocab_size, hidden_size]  token embedding table
+    half*  lm_head;              // [vocab_size, hidden_size]  alias of embed_tokens (tie_word_embeddings=true)
     float* final_norm;           // [hidden_size]              FP32
     std::vector<Qwen3LayerWeights> layers;
 

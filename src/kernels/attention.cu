@@ -43,15 +43,20 @@ __global__ void flash_attention_prefill_kernel(
     const int h_kv   = h_q * H_kv / H_q;    // GQA: integer division
 
     const int q_row = q_tile * Br + r;       // Global row in Q
-    if (q_row >= S) return;
+    // NOTE: do NOT return early here — all Br threads must participate in the
+    // cooperative K/V tile load and reach every __syncthreads().  Use a flag
+    // instead and skip computation/writes for out-of-bounds rows.
+    const bool valid_q = (q_row < S);
 
     // Shared memory — K and V tiles, FP16
     __shared__ half K_smem[Bc][HEAD_DIM];
     __shared__ half V_smem[Bc][HEAD_DIM];
 
-    // Load Q row into registers (FP32, converted once)
+    // Load Q row into registers (FP32, converted once) — only for valid rows.
     float q_reg[HEAD_DIM];
-    {
+    #pragma unroll
+    for (int d = 0; d < HEAD_DIM; d++) q_reg[d] = 0.0f;
+    if (valid_q) {
         const half* q_ptr = Q + ((long)(b * S + q_row) * H_q + h_q) * HEAD_DIM;
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; d++)
@@ -71,8 +76,11 @@ __global__ void flash_attention_prefill_kernel(
         const int tile_start = kv_tile * Bc;
 
         // ------------------------------------------------------------------
-        // Cooperative load: Br threads fill K_smem and V_smem (Bc rows each)
-        // Each thread is responsible for rows: r, r+Br, r+2*Br, r+3*Br
+        // Cooperative load: ALL Br threads fill K_smem and V_smem (Bc rows).
+        // Each thread is responsible for rows: r, r+Br, r+2*Br, r+3*Br.
+        // All threads must participate — including those with q_row >= S —
+        // so that every K/V row needed by valid threads is populated before
+        // the __syncthreads() below.
         // ------------------------------------------------------------------
         for (int row = r; row < Bc; row += Br) {
             const int kv_row = tile_start + row;
@@ -85,47 +93,50 @@ __global__ void flash_attention_prefill_kernel(
                     V_smem[row][d] = v_ptr[d];
                 }
             }
-            // Out-of-bounds rows are never accessed (tile_end guards the inner loop)
         }
         __syncthreads();
 
         // ------------------------------------------------------------------
-        // Compute attention scores and update online softmax
+        // Compute attention scores and update online softmax (valid rows only)
         // ------------------------------------------------------------------
-        const int tile_end = min(tile_start + Bc, S);
-        for (int c = 0; c < tile_end - tile_start; c++) {
-            const int kv_pos = tile_start + c;
-            // Causal mask: later positions in this row are also masked (break ok)
-            if (kv_pos > q_row) break;
+        if (valid_q) {
+            const int tile_end = min(tile_start + Bc, S);
+            for (int c = 0; c < tile_end - tile_start; c++) {
+                const int kv_pos = tile_start + c;
+                // Causal mask: later positions in this row are also masked (break ok)
+                if (kv_pos > q_row) break;
 
-            // Dot product: Q[q_row] · K[kv_pos]
-            float dot = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; d++)
-                dot += q_reg[d] * __half2float(K_smem[c][d]);
-            dot *= scale;
+                // Dot product: Q[q_row] · K[kv_pos]
+                float dot = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < HEAD_DIM; d++)
+                    dot += q_reg[d] * __half2float(K_smem[c][d]);
+                dot *= scale;
 
-            // Online softmax update (numerically stable)
-            const float new_max = fmaxf(row_max, dot);
-            const float alpha   = expf(row_max - new_max);  // rescale old accum
-            const float p       = expf(dot - new_max);       // weight for new token
+                // Online softmax update (numerically stable)
+                const float new_max = fmaxf(row_max, dot);
+                const float alpha   = expf(row_max - new_max);  // rescale old accum
+                const float p       = expf(dot - new_max);       // weight for new token
 
-            row_sum = row_sum * alpha + p;
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; d++)
-                o_acc[d] = o_acc[d] * alpha + p * __half2float(V_smem[c][d]);
+                row_sum = row_sum * alpha + p;
+                #pragma unroll
+                for (int d = 0; d < HEAD_DIM; d++)
+                    o_acc[d] = o_acc[d] * alpha + p * __half2float(V_smem[c][d]);
 
-            row_max = new_max;
+                row_max = new_max;
+            }
         }
         __syncthreads();
     }
 
-    // Normalise and write output (FP32 → FP16)
-    half* o_ptr = O + ((long)(b * S + q_row) * H_q + h_q) * HEAD_DIM;
-    const float inv_sum = 1.0f / row_sum;
-    #pragma unroll
-    for (int d = 0; d < HEAD_DIM; d++)
-        o_ptr[d] = __float2half(o_acc[d] * inv_sum);
+    // Normalise and write output (FP32 → FP16) — valid rows only
+    if (valid_q) {
+        half* o_ptr = O + ((long)(b * S + q_row) * H_q + h_q) * HEAD_DIM;
+        const float inv_sum = 1.0f / row_sum;
+        #pragma unroll
+        for (int d = 0; d < HEAD_DIM; d++)
+            o_ptr[d] = __float2half(o_acc[d] * inv_sum);
+    }
 }
 
 // =============================================================================
