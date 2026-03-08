@@ -34,6 +34,7 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 │  │ Sampling    │                    │ KL Penalty  │  │
 │  └─────────────┘                    └─────────────┘  │
 └─────────────────────────────────────────────────────┘
+```
 
 ---
 
