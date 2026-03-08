@@ -1,19 +1,5 @@
 #include "kernels/rmsnorm.cuh"
 
-// ---------------------------------------------------------------------------
-// Kernel
-// ---------------------------------------------------------------------------
-// One block per row.  Shared memory holds one float per warp for the
-// inter-warp reduction step (max 32 warps = 1024-thread block).
-//
-// Reduction strategy:
-//   1. Each thread accumulates sum(x^2) over its assigned columns (FP32).
-//   2. Warp-level reduction via __shfl_xor_sync.
-//   3. Warp leaders write to smem; thread 0 does a sequential reduction over
-//      n_warps values and broadcasts the total back through smem.
-//   4. All threads normalise their elements: out[i] = x[i] * rsqrt(mean_sq + eps) * w[i]
-// ---------------------------------------------------------------------------
-
 __global__ void rmsnorm_kernel(
     half*        out,
     const half*  x,

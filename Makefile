@@ -49,6 +49,9 @@ $(BUILDDIR)/test_embedding: src/kernels/embedding.cu tests/test_embedding.cu | $
 $(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
 
+$(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
 QWEN3_SRCS := src/model/qwen3.cu src/model/kv_cache.cu \
               src/kernels/rmsnorm.cu src/kernels/rope.cu src/kernels/attention.cu \
               src/kernels/swiglu.cu src/kernels/embedding.cu src/kernels/linear.cu \
@@ -60,6 +63,11 @@ $(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu | $(BUILDDIR)
 $(BUILDDIR)/bench_decode: $(QWEN3_SRCS) tests/bench_decode.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
 
+ENGINE_SRCS := $(QWEN3_SRCS) src/kernels/sampler.cu
+
+$(BUILDDIR)/test_llmengine: $(ENGINE_SRCS) tests/test_llmengine.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
 $(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@
 
@@ -68,7 +76,7 @@ $(BUILDDIR):
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_qwen3 test_loading_weights bench_decode tests generate_refs clean
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights bench_decode test_llmengine tests generate_refs clean
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -94,6 +102,9 @@ test_embedding: $(BUILDDIR)/test_embedding
 test_linear: $(BUILDDIR)/test_linear
 	./$(BUILDDIR)/test_linear
 
+test_sampler: $(BUILDDIR)/test_sampler
+	./$(BUILDDIR)/test_sampler
+
 test_qwen3: $(BUILDDIR)/test_qwen3
 	./$(BUILDDIR)/test_qwen3
 
@@ -103,7 +114,10 @@ test_loading_weights: $(BUILDDIR)/test_loading_weights
 bench_decode: $(BUILDDIR)/bench_decode
 	./$(BUILDDIR)/bench_decode
 
-tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_qwen3 test_loading_weights
+test_llmengine: $(BUILDDIR)/test_llmengine
+	./$(BUILDDIR)/test_llmengine
+
+tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights test_llmengine
 
 # ── PyTorch reference generator ───────────────────────────────────────────────
 

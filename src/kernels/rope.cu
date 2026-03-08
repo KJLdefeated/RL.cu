@@ -4,16 +4,6 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-// =============================================================================
-// Precompute kernel
-// =============================================================================
-// Grid:  (max_seq_len, 1)
-// Block: (head_dim/2)       — one thread per frequency index
-//
-// cos_table[pos * half_dim + i] = cos(pos / rope_theta^(2i/head_dim))
-// sin_table[pos * half_dim + i] = sin(pos / rope_theta^(2i/head_dim))
-// =============================================================================
-
 __global__ void rope_precompute_kernel(
     float* cos_table,   // [max_seq_len, half_dim]
     float* sin_table,   // [max_seq_len, half_dim]
@@ -21,9 +11,7 @@ __global__ void rope_precompute_kernel(
     float log_rope_theta  // logf(rope_theta) — avoids recomputing per thread
 ) {
     const int pos  = blockIdx.x;
-    const int freq = threadIdx.x;   // 0..half_dim-1
-
-    // inv_freq = rope_theta^(-2*freq/head_dim) = exp(-2*freq/head_dim * log_theta)
+    const int freq = threadIdx.x;
     const float inv_freq = expf(-2.0f * freq * log_rope_theta / (float)(2 * half_dim));
     const float angle    = (float)pos * inv_freq;
 
@@ -48,24 +36,6 @@ void launch_rope_precompute(
         logf(rope_theta)
     );
 }
-
-// =============================================================================
-// RoPE apply kernel
-// =============================================================================
-// Grid:  (num_tokens, num_q_heads)
-// Block: (head_dim/2)     — one thread per rotation pair
-//
-// Thread (tok, h, i):
-//   c = cos_table[pos][i],  s = sin_table[pos][i]
-//   Q[tok][h][i]         = Q[tok][h][i]          * c - Q[tok][h][i+D/2] * s
-//   Q[tok][h][i + D/2]   = Q[tok][h][i + D/2]   * c + Q[tok][h][i]     * s
-//
-// For h < num_kv_heads: same rotation applied to K[tok][h].
-//
-// The two writes per thread are to the SAME head but different offsets, so
-// we must read both q0 and q1 before writing either (no RAW hazard since
-// both operands come from registers).
-// =============================================================================
 
 __global__ void rope_kernel(
     half*        __restrict__ Q,          // [num_tokens, H_q,  D]

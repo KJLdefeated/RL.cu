@@ -6,26 +6,15 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 
 ---
 
-## Landscape & Related Work
+## Contribution
 
-### Existing Projects (What Exists)
+1. nano-vLLM like inference engine written by CUDA/C++
+2. pure C++/CUDA training infra for SFT / RL
+3. optimized inference CUDA kernel
 
-| Project | What It Does | Gap for You |
-|---------|-------------|-------------|
-| **llm.c** (Karpathy) | Pure C/CUDA LLM *pretraining* (GPT-2/3). ~7% faster than PyTorch. | No RL training, no GRPO, no modern architectures (Qwen) |
-| **veRL** (ByteDance) | Full RLHF/GRPO framework. Python + PyTorch + vLLM + Ray | Heavy Python stack, not pure C++/CUDA |
-| **OpenRLHF** | Scalable RLHF/GRPO via Ray + vLLM + DeepSpeed | Same — Python ecosystem |
-| **NeMo-RL** (NVIDIA) | GRPO training, reproduced DeepScaleR | Python + Megatron-LM + vLLM |
-| **TRL** (HuggingFace) | GRPOTrainer in Python | Pure Python, not optimized |
-| **llama.cpp** | C/C++ inference for many architectures including Qwen3 | Inference only, no training, no RL |
-| **Unsloth** | Memory-efficient GRPO with custom CUDA kernels | Still Python/PyTorch wrapper |
-| **ROLL** (Alibaba) | Scalable RL for LLMs with Megatron + SGLang | Python ecosystem |
-
-### Key Insight: The Gap
+### Key Insight:
 
 **Nobody has built pure C++/CUDA GRPO training.** llm.c proved C/CUDA pretraining is viable and even faster. The RL training loop (GRPO specifically) has never been done outside the Python ecosystem. This is a genuine open-source contribution.
-
----
 
 ## Architecture Overview
 
@@ -60,17 +49,15 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [x] Implement FA2 kernel + PagedKV
 - [x] Write safetensors loader in C++ (parse header JSON, mmap tensors)
 - [x] Run Qwen3-0.6B forward: Prefill + Decode
-- [ ] Sampler
-- [ ] Benchmark forward speed with huggingface implementation (FA2 + KV Cache)
-- [ ] Qwen3-4B forward & benchmark
+- [x] Sampler
 
 ### Phase 1: Inference Engine
 
 #### 2 Weeks: vLLM Style reproduce
-- [ ] Reference to nano vllm
-- [ ] Model runner (allocate correct KV cache size, batch forward)
-- [ ] Scheduler (schedule input request)
-- [ ] LLM Engine
+- [x] Reference to nano vllm
+- [x] Model runner (allocate correct KV cache size, batch forward)
+- [x] Scheduler (schedule input request)
+- [x] LLM Engine
 - [ ] Benchmark with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
 
 ### Phase 2: Training Infrastructure
@@ -93,7 +80,7 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [ ] Implement learning rate scheduler (cosine with warmup)
 - [ ] Build basic SFT training loop: load data → forward → loss → backward → step
 - [ ] Validate on tiny dataset: loss should decrease matching PyTorch
-- [ ] **Milestone**: Successful SFT fine-tuning matching PyTorch training curves
+- [ ] Successful SFT fine-tuning matching PyTorch training curves
 
 ### Phase 3: GRPO Implementation (April 2026)
 

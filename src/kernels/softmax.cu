@@ -72,9 +72,7 @@ __global__ void softmax_kernel(
     const half* x_row = x   + (long)row * cols;
     half*       o_row = out + (long)row * cols;
 
-    // ------------------------------------------------------------------
     // Pass 1: find row max
-    // ------------------------------------------------------------------
     float local_max = -1e20f;
     for (int i = tid; i < cols; i += blockDim.x) {
         float xi = __half2float(x_row[i]);
@@ -83,9 +81,7 @@ __global__ void softmax_kernel(
     block_reduce_max(local_max, smem, tid, n_warps);
     const float global_max = local_max;
 
-    // ------------------------------------------------------------------
     // Pass 2: sum of exp(x - max)
-    // ------------------------------------------------------------------
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += blockDim.x) {
         float xi   = __half2float(x_row[i]);
@@ -94,18 +90,14 @@ __global__ void softmax_kernel(
     block_reduce_sum(local_sum, smem, tid, n_warps);
     const float inv_sum = 1.0f / local_sum;
 
-    // ------------------------------------------------------------------
     // Pass 3: write normalised values
-    // ------------------------------------------------------------------
     for (int i = tid; i < cols; i += blockDim.x) {
         float xi  = __half2float(x_row[i]);
         o_row[i] = __float2half(expf(xi - global_max) * inv_sum);
     }
 }
 
-// ---------------------------------------------------------------------------
 // Launch wrapper
-// ---------------------------------------------------------------------------
 void launch_softmax(
     half*        out,
     const half*  x,

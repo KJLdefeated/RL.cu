@@ -1,15 +1,5 @@
 #include "kernels/swiglu.cuh"
 
-// ---------------------------------------------------------------------------
-// Kernel
-// ---------------------------------------------------------------------------
-// Fused SwiGLU: out[i] = silu(gate[i]) * up[i]
-// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-//
-// One thread per element; trivially parallelisable.
-// FP16 I/O, FP32 compute.
-// ---------------------------------------------------------------------------
-
 __global__ void swiglu_kernel(
     half*       out,
     const half* gate,
@@ -25,9 +15,7 @@ __global__ void swiglu_kernel(
     out[i] = __float2half(silu * u);
 }
 
-// ---------------------------------------------------------------------------
 // Launch wrapper
-// ---------------------------------------------------------------------------
 void launch_swiglu(
     half*        out,
     const half*  gate,

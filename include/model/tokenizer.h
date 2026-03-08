@@ -1,21 +1,4 @@
 #pragma once
-
-// ---------------------------------------------------------------------------
-// Tokenizer — BPE tokenizer for Qwen3 (HuggingFace tokenizer.json format)
-//
-// Supports:
-//   tokenizer.load(path/to/tokenizer.json)
-//   tokenizer.encode(text)   → vector<int>   text → token IDs
-//   tokenizer.decode(ids)    → string        token IDs → text
-//   tokenizer.decode_token(id) → string      single token ID → text
-//
-// Implementation:
-//   - GPT-2 byte-to-unicode mapping (byte_fallback=false, byte-level BPE)
-//   - Simplified pre-tokenizer: attaches leading space to following word,
-//     splits contractions, handles punctuation.  Correct for typical English.
-//   - Standard greedy BPE: finds lowest-rank merge per pass.
-// ---------------------------------------------------------------------------
-
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -30,10 +13,10 @@
 struct Tokenizer {
 public:
     // Special token IDs (Qwen3)
-    int bos_id = 151643;   // <|endoftext|>
-    int eos_id = 151645;   // <|im_end|>
-    int im_start_id = 151644;
-    int im_end_id   = 151645;
+    int64_t bos_id = 151643;   // <|endoftext|>
+    int64_t eos_id = 151645;   // <|im_end|>
+    int64_t im_start_id = 151644;
+    int64_t im_end_id   = 151645;
 
     bool load(const std::string& tokenizer_json_path) {
         std::ifstream f(tokenizer_json_path);
@@ -51,23 +34,23 @@ public:
             char_to_byte_[byte_char_[b]] = static_cast<uint8_t>(b);
 
         // Vocab: token string → id
-        int max_id = 0;
+        int64_t max_id = 0;
         for (auto& [tok, id] : tj["model"]["vocab"].items())
-            max_id = std::max(max_id, id.get<int>());
+            max_id = std::max(max_id, id.get<int64_t>());
         for (auto& at : tj["added_tokens"])
-            max_id = std::max(max_id, at["id"].get<int>());
+            max_id = std::max(max_id, at["id"].get<int64_t>());
 
         id_to_token_.resize(max_id + 1);
         is_special_.resize(max_id + 1, false);
         vocab_.reserve(max_id + 1);
 
         for (auto& [tok, id] : tj["model"]["vocab"].items()) {
-            int i = id.get<int>();
+            int64_t i = id.get<int64_t>();
             vocab_[tok] = i;
             id_to_token_[i] = tok;
         }
         for (auto& at : tj["added_tokens"]) {
-            int i = at["id"].get<int>();
+            int64_t i = at["id"].get<int64_t>();
             std::string tok = at["content"].get<std::string>();
             vocab_[tok] = i;
             id_to_token_[i] = tok;
@@ -93,8 +76,8 @@ public:
     // Encode text → token IDs.
     // Special tokens (e.g. <|im_start|>) are matched greedily as atomic units
     // before BPE is applied to the remaining text segments.
-    std::vector<int> encode(const std::string& text) const {
-        std::vector<int> ids;
+    std::vector<int64_t> encode(const std::string& text) const {
+        std::vector<int64_t> ids;
         int i = 0, n = text.size();
 
         while (i < n) {
@@ -142,29 +125,29 @@ public:
     }
 
     // Add a special token by its string content (returns its ID)
-    int encode_special(const std::string& tok) const {
+    int64_t encode_special(const std::string& tok) const {
         auto it = vocab_.find(tok);
         return (it != vocab_.end()) ? it->second : -1;
     }
 
     // Decode single token ID → UTF-8 string (empty string for special tokens)
-    std::string decode_token(int id) const {
-        if (id < 0 || id >= (int)id_to_token_.size()) return "";
+    std::string decode_token(int64_t id) const {
+        if (id < 0 || id >= (int64_t)id_to_token_.size()) return "";
         if (is_special_[id]) return "";           // skip special tokens in output
         return chars_to_bytes(id_to_token_[id]);
     }
 
     // Decode list of token IDs → UTF-8 string
-    std::string decode(const std::vector<int>& ids) const {
+    std::string decode(const std::vector<int64_t>& ids) const {
         std::string out;
-        for (int id : ids) out += decode_token(id);
+        for (int64_t id : ids) out += decode_token(id);
         return out;
     }
 
     int vocab_size() const { return (int)id_to_token_.size(); }
 
-    bool is_special(int id) const {
-        return id >= 0 && id < (int)is_special_.size() && is_special_[id];
+    bool is_special(int64_t id) const {
+        return id >= 0 && id < (int64_t)is_special_.size() && is_special_[id];
     }
 
     // Build a Qwen3-chat prompt for a single user message.
@@ -186,9 +169,9 @@ public:
     }
 
 private:
-    struct SpecTok { std::string str; int id; };
+    struct SpecTok { std::string str; int64_t id; };
 
-    std::unordered_map<std::string, int>      vocab_;
+    std::unordered_map<std::string, int64_t>  vocab_;
     std::vector<std::string>                  id_to_token_;
     std::vector<bool>                         is_special_;
     std::vector<SpecTok>                      special_tokens_;  // sorted longest-first

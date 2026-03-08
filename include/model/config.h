@@ -2,8 +2,6 @@
 #include <string>
 #include <cstdint>
 
-// Qwen3Config: All fields from HuggingFace config.json
-// Parsed at runtime so one binary supports 0.6B, 4B, 8B etc.
 struct Qwen3Config {
     int vocab_size          = 151936;
     int hidden_size         = 1024;
@@ -20,10 +18,9 @@ struct Qwen3Config {
     std::string hidden_act  = "silu";
     std::string torch_dtype = "bfloat16";
 
-    // Derived (computed after parsing)
-    int n_rep;              // num_attention_heads / num_key_value_heads
-    int q_dim;              // num_attention_heads * head_dim
-    int kv_dim;             // num_key_value_heads * head_dim
+    int n_rep;
+    int q_dim;
+    int kv_dim;
 
     void compute_derived() {
         n_rep  = num_attention_heads / num_key_value_heads;
@@ -32,5 +29,25 @@ struct Qwen3Config {
     }
 };
 
-// Parse config.json from model directory into Qwen3Config
 Qwen3Config load_config(const std::string& model_dir);
+
+struct Config {
+    std::string model; // Model dir
+    std::string tokenizer_path; // Tokenizer path
+    int max_num_batched_tokens = 16384;
+    int max_num_seqs = 512;
+    int max_model_len = 4096;
+    float gpu_memory_utilization = 0.9;
+    bool enforce_eager = false;
+    Qwen3Config model_config;
+    int64_t eos = -1;
+    int kv_block_size = 16;  // must match KV_BLOCK_SIZE in kv_cache.cuh
+    int num_kv_blocks = -1;
+    Config(std::string model_dir) {
+        model = model_dir;
+        tokenizer_path = model_dir + "/tokenizer.json";
+        model_config = load_config(model_dir);
+        eos = model_config.vocab_size - 1; // assuming EOS token is the last token in vocab
+        num_kv_blocks = (max_model_len + kv_block_size - 1) / kv_block_size;
+    }
+};
