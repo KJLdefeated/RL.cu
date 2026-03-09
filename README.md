@@ -11,10 +11,7 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 1. nano-vLLM like inference engine written by CUDA/C++
 2. pure C++/CUDA training infra for SFT / RL
 3. optimized inference CUDA kernel
-
-### Key Insight:
-
-**Nobody has built pure C++/CUDA GRPO training.** llm.c proved C/CUDA pretraining is viable and even faster. The RL training loop (GRPO specifically) has never been done outside the Python ecosystem. This is a genuine open-source contribution.
+4. Ene-to-end RL training in CUDA/C++
 
 ## Architecture Overview
 
