@@ -1,13 +1,10 @@
-# GRPO-CUDA: Pure C++/CUDA LLM Reinforcement Learning Training
+# RL.cu: Pure C++/CUDA LLM Reinforcement Learning Training
 
 ## Project Vision
 
 Build an open-source, pure C++/CUDA framework for LLM reinforcement learning training — specifically GRPO (Group Relative Policy Optimization) — targeting Qwen3-4B, with **zero Python/PyTorch dependency** at runtime.
 
----
-
-## Contribution
-
+## Features
 1. nano-vLLM like inference engine written by CUDA/C++
 2. pure C++/CUDA training infra for SFT / RL
 3. optimized inference CUDA kernel
@@ -27,15 +24,14 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 │        ▼                                     ▼       │
 │  ┌─────────────┐                    ┌─────────────┐  │
 │  │ FA2 Kernel  │                    │ AdamW Opt   │  │
-│  │ KV Cache    │                    │ Grad Accum  │  │
+│  │ Paged KV    │                    │ Grad Accum  │  │
 │  │ Sampling    │                    │ KL Penalty  │  │
 │  └─────────────┘                    └─────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
-
 ---
 
-## Detailed Monthly Roadmap
+## Roadmap
 
 ### Phase 0: Foundation (Feb 2026)
 
@@ -100,6 +96,5 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [ ] Writing documents and interface
 - [ ] Release on Github (in May hopely)
 - [ ] Benchmark with Slime & VeRL
-
 
 ### Future: Performance optimization, multi-GPU support.
