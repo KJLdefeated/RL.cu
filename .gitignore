@@ -13,3 +13,5 @@ include/third_party/
 
 # Claude Code
 .claude/settings.local.json
+
+python_scripts/nano-vllm

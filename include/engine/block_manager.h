@@ -146,11 +146,10 @@ public:
     }
 
     // Returns true if we have room to append one more token.
+    // A new block is needed when the current size is exactly at a block boundary,
+    // i.e., the next token will be the first token of a new block.
     bool can_append(Sequence& seq) {
-        // Need a new block only when seq length is a multiple of block_size
-        // (i.e., the last token just completed a block and we need a fresh one).
-        bool needs_new_block = (seq.size() % block_size == 0);
-        return !needs_new_block || !free_block_ids.empty();
+        return free_block_ids.size() >= (size_t)(seq.size() % block_size == 0);
     }
 
     // Called after a new token has been appended to seq.token_ids.

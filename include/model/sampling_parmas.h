@@ -9,6 +9,7 @@ struct SamplingParams {
     float top_p = 1.0f;
     int64_t top_k = 0;
     bool do_sample = true;
+    bool ignore_eos = false;  // if true, never stop on EOS token (only on max_new_tokens)
 };
 
 // sequence status

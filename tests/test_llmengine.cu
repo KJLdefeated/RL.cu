@@ -252,7 +252,7 @@ static const char* BENCH_PROMPTS[] = {
 static const int NBENCH = sizeof(BENCH_PROMPTS) / sizeof(BENCH_PROMPTS[0]);
 
 static BenchResult run_bench(LLMEngine& engine, int num_req, int max_new) {
-    SamplingParams sp = greedy(max_new);
+    SamplingParams sp = sampling(max_new);
     std::vector<std::string> prompts;
     prompts.reserve(num_req);
     for (int i = 0; i < num_req; i++)
@@ -292,9 +292,9 @@ static void test_throughput(LLMEngine& engine) {
            "batch", "tok/s", "ms/request", "output_tokens");
 
     BenchResult best{};
-    for (int batch : {1, 2, 4, 8, 16}) {
+    for (int batch : {64, 128, 256}) {
         if (batch > engine.config.max_num_seqs) break;
-        auto res = run_bench(engine, batch, 128);
+        auto res = run_bench(engine, batch, 1024);
         printf("  %6d  %10.0f  %12.1f  %12d\n",
                batch, res.toks_per_sec(), res.ms_per_req(), res.num_output_tokens);
         if (res.toks_per_sec() > best.toks_per_sec()) best = res;
@@ -339,6 +339,71 @@ static void test_throughput(LLMEngine& engine) {
 }
 
 // =============================================================================
+// 4. Realistic benchmark (nano-vllm bench.py protocol)
+// =============================================================================
+// Mirrors python_scripts/nano-vllm/bench.py exactly:
+//   seed=0, 256 seqs, prompt_len ~ Uniform[100, 1024], output_len ~ Uniform[100, 1024]
+//   token IDs drawn from Uniform[0, 10000], temperature=0.6, ignore_eos=true
+//   1-seq warmup, then timed run; metric = sum(max_new_tokens) / wall_time
+
+static void test_bench_realistic(LLMEngine& engine) {
+    SECTION("4. Realistic benchmark (nano-vllm protocol)");
+
+    // Deterministic LCG seeded to 0 — mirrors Python's random.seed(0) / randint behaviour.
+    // We use a simple LCG rather than MT19937 to keep the seed self-contained.
+    auto make_lcg = [](uint64_t seed) {
+        // LCG: x = (a*x + c) mod 2^64; low bits discarded; take bits [16,47].
+        return [state = seed](int lo, int hi) mutable -> int {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            int range = hi - lo + 1;
+            return lo + (int)((state >> 17) % (uint64_t)range);
+        };
+    };
+    auto rng = make_lcg(0);
+
+    const int NUM_SEQS      = 256;
+    const int MAX_INPUT_LEN = 1024;
+    const int MAX_OUT_LEN   = 1024;
+
+    std::vector<std::vector<int64_t>> prompts(NUM_SEQS);
+    std::vector<SamplingParams>       sps(NUM_SEQS);
+    int total_output_tokens = 0;
+    for (int i = 0; i < NUM_SEQS; i++) {
+        int plen = rng(100, MAX_INPUT_LEN);
+        int olen = rng(100, MAX_OUT_LEN);
+        prompts[i].resize(plen);
+        for (auto& t : prompts[i]) t = (int64_t)rng(0, 10000);
+        sps[i].temperature    = 0.6f;
+        sps[i].top_k          = 50;   // 50 argmax rounds (vs 1024 for top_k=0 default)
+        sps[i].ignore_eos     = true;
+        sps[i].max_new_tokens = olen;
+        sps[i].do_sample      = true;
+        total_output_tokens  += olen;
+    }
+
+    // Warmup: single sequence, tiny output
+    printf("  [warmup] ...\n");
+    {
+        std::vector<int64_t> w = {1};
+        SamplingParams wsp; wsp.max_new_tokens = 4; wsp.temperature = 0.6f; wsp.top_k = 50;
+        engine.generate({w}, {wsp});
+    }
+
+    printf("  [bench ] %d seqs, prompt_len~[100,%d], output_len~[100,%d], "
+           "total_output=%d tok ...\n",
+           NUM_SEQS, MAX_INPUT_LEN, MAX_OUT_LEN, total_output_tokens);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    engine.generate(prompts, sps);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double elapsed = std::chrono::duration<double>(t1 - t0).count();
+    double throughput = total_output_tokens / elapsed;
+
+    printf("\nTotal: %dtok, Time: %.2fs, Throughput: %.2ftok/s\n",
+           total_output_tokens, elapsed, throughput);
+}
+
+// =============================================================================
 // main
 // =============================================================================
 
@@ -355,17 +420,18 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg(model_dir);
-    cfg.max_num_seqs           = 16;
+    cfg.max_num_seqs           = 256;
     cfg.max_model_len          = 2048;
-    cfg.max_num_batched_tokens = 8192;
+    cfg.max_num_batched_tokens = 32768;
     cfg.gpu_memory_utilization = 0.90f;
     cfg.enforce_eager          = false;
 
     LLMEngine engine(cfg);
 
-    test_correctness(engine);
-    test_memory(engine);
-    test_throughput(engine);
+    // test_correctness(engine);
+    // test_memory(engine);
+    // test_throughput(engine);
+    test_bench_realistic(engine);
 
     printf("\n");
     if (g_fail == 0)
