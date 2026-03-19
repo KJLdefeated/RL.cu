@@ -1,20 +1,14 @@
-# GRPO-CUDA: Pure C++/CUDA LLM Reinforcement Learning Training
+# RL.cu: Pure C++/CUDA LLM Reinforcement Learning Training
 
 ## Project Vision
 
 Build an open-source, pure C++/CUDA framework for LLM reinforcement learning training — specifically GRPO (Group Relative Policy Optimization) — targeting Qwen3-4B, with **zero Python/PyTorch dependency** at runtime.
 
----
-
-## Contribution
-
+## Features
 1. nano-vLLM like inference engine written by CUDA/C++
 2. pure C++/CUDA training infra for SFT / RL
 3. optimized inference CUDA kernel
-
-### Key Insight:
-
-**Nobody has built pure C++/CUDA GRPO training.** llm.c proved C/CUDA pretraining is viable and even faster. The RL training loop (GRPO specifically) has never been done outside the Python ecosystem. This is a genuine open-source contribution.
+4. Ene-to-end RL training in CUDA/C++
 
 ## Architecture Overview
 
@@ -30,20 +24,16 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 │        ▼                                     ▼       │
 │  ┌─────────────┐                    ┌─────────────┐  │
 │  │ FA2 Kernel  │                    │ AdamW Opt   │  │
-│  │ KV Cache    │                    │ Grad Accum  │  │
+│  │ Paged KV    │                    │ Grad Accum  │  │
 │  │ Sampling    │                    │ KL Penalty  │  │
 │  └─────────────┘                    └─────────────┘  │
 └─────────────────────────────────────────────────────┘
-
+```
 ---
 
-## Detailed Monthly Roadmap
+## Roadmap
 
-### Phase 0: Foundation (Feb 2026)
-
-**Goal**: Master CUDA fundamentals and FA2; establish project skeleton.
-
-#### Week 1-2: CUDA Fundamentals & Project Setup
+#### Fundamental Kernels & Project Setup
 - [x] Set up project repo with build system (CMake + CUDA)
 - [x] Implement basic CUDA kernels: RMSNorm, SwiGLU, RoPE embedding, Softmax, linear layer (cublas wrapper)
 - [x] Implement FA2 kernel + PagedKV
@@ -51,18 +41,14 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [x] Run Qwen3-0.6B forward: Prefill + Decode
 - [x] Sampler
 
-### Phase 1: Inference Engine
-
-#### 2 Weeks: vLLM Style reproduce
+### vLLM Style reproduce
 - [x] Reference to nano vllm
 - [x] Model runner (allocate correct KV cache size, batch forward)
 - [x] Scheduler (schedule input request)
 - [x] LLM Engine
 - [ ] Benchmark with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
 
-### Phase 2: Training Infrastructure
-
-#### 3 Weeks: SFT Full Finetuning
+### SFT Full Finetuning
 - [ ] Dataset loading (maybe need apache arrow)
 - [ ] Implement backward kernels for every forward op:
   - Attention backward (FA2 backward already done in Phase 0)
@@ -82,11 +68,7 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [ ] Validate on tiny dataset: loss should decrease matching PyTorch
 - [ ] Successful SFT fine-tuning matching PyTorch training curves
 
-### Phase 3: GRPO Implementation (April 2026)
-
-**Goal**: Full GRPO training loop working end-to-end.
-
-#### Week 1: GRPO Core Algorithm
+### GRPO Core Algorithm
 - [ ] Implement reference model (frozen weight copy, shared memory where possible)
 - [ ] Implement basic math reward: parse answer, check correctness
 - [ ] Implement GRPO rollout pipeline (connect with inference engine)
@@ -96,12 +78,11 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [ ] Implement basic math reward: parse answer, check correctness
 - [ ] **Milestone**: Single GRPO training step producing correct loss
 
-#### Week 2: Integration
+#### Integration
 - [ ] Build end-to-end GRPO training pipeline
 - [ ] Train qwen3-4B on dapo-math-17k & test on AIME/24,25
 - [ ] Writing documents and interface
 - [ ] Release on Github (in May hopely)
 - [ ] Benchmark with Slime & VeRL
-
 
 ### Future: Performance optimization, multi-GPU support.
