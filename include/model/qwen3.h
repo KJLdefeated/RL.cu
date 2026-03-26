@@ -88,3 +88,178 @@ void compute_logits(Qwen3Model* m, int B, int S, cudaStream_t stream);
 
 // Free KV blocks for a finished sequence at batch slot b, reset seq state.
 void qwen3_free_seq_slot(Qwen3Model* m, int b);
+
+// =============================================================================
+// Training forward pass
+// =============================================================================
+
+// Saved activations for backward pass.
+// All per-layer arrays are indexed by layer: ptr_array[layer_idx] → device pointer.
+// Bulk-allocated in two pools (half activations + float LSE).
+struct Qwen3TrainState {
+    int B = 0, S = 0, T = 0;   // batch, seq_len, total tokens (B*S)
+    int num_layers = 0;
+
+    // --- Bulk GPU allocations ---
+    half*  activation_pool = nullptr;   // one big alloc for all half activations
+    float* lse_pool        = nullptr;   // one big alloc for all LSE (FP32)
+
+    // Per-layer saved activations (pointers into pools)
+    half** layer_input     = nullptr;   // [L] → [T, hidden]         pre-input_norm residual
+    half** layer_Q_raw     = nullptr;   // [L] → [T, q_dim]          after q_proj, before QK-norm
+    half** layer_K_raw     = nullptr;   // [L] → [T, kv_dim]         after k_proj, before QK-norm
+    half** layer_Q         = nullptr;   // [L] → [T, q_dim]          after QK-norm + RoPE
+    half** layer_K         = nullptr;   // [L] → [T, kv_dim]         after QK-norm + RoPE
+    half** layer_V         = nullptr;   // [L] → [T, kv_dim]         V values (unchanged)
+    half** layer_O         = nullptr;   // [L] → [T, q_dim]          attention output
+    half** layer_post_attn = nullptr;   // [L] → [T, hidden]         pre-post_attn_norm residual
+    half** layer_gate      = nullptr;   // [L] → [T, intermediate]   gate proj output
+    half** layer_up        = nullptr;   // [L] → [T, intermediate]   up proj output
+    float** layer_lse      = nullptr;   // [L] → [B, S, H_q]         logsumexp from FA2
+
+    // Final stage
+    half* final_hidden     = nullptr;   // [T, hidden] — after all layers, before final_norm
+
+    // Device copies of IDs
+    int* d_token_ids       = nullptr;   // [T] input token ids
+    int* d_target_ids      = nullptr;   // [T] target token ids (for log_prob gathering)
+    int* d_pos_ids         = nullptr;   // [T] position ids
+};
+
+Qwen3TrainState* qwen3_train_state_alloc(const Qwen3Config& c, int B, int S);
+void qwen3_train_state_free(Qwen3TrainState* state);
+
+// Training forward pass.
+// Runs full sequence through all layers (no KV cache), computes log_probs.
+//   h_token_ids:  [B*S] input tokens (host)
+//   h_target_ids: [B*S] target tokens (host), typically token_ids shifted left by 1
+//   d_log_probs:  [B*S] output log-probabilities (device, FP32, pre-allocated)
+// Saves all activations needed for backward into state.
+void qwen3_forward(
+    Qwen3Model* m,
+    Qwen3TrainState* state,
+    const int* h_token_ids,
+    const int* h_target_ids,
+    float* d_log_probs,
+    int B, int S,
+    cudaStream_t stream = 0
+);
+
+// =============================================================================
+// Training backward pass
+// =============================================================================
+
+// Weight gradients for backward pass.
+// All gradient buffers are bulk-allocated; per-layer pointers index into pools.
+struct Qwen3Gradients {
+    int num_layers = 0;
+
+    // --- Bulk GPU allocations ---
+    half*  half_pool  = nullptr;   // all FP16 weight gradients
+    float* float_pool = nullptr;   // all FP32 weight gradients (norms) + D_buf
+    size_t half_pool_bytes  = 0;
+    size_t float_pool_bytes = 0;
+
+    // Per-layer weight gradients (pointers into pools)
+    half** dW_q_proj          = nullptr;  // [L] → [q_dim, hidden]
+    half** dW_k_proj          = nullptr;  // [L] → [kv_dim, hidden]
+    half** dW_v_proj          = nullptr;  // [L] → [kv_dim, hidden]
+    half** dW_o_proj          = nullptr;  // [L] → [hidden, q_dim]
+    half** dW_gate_proj       = nullptr;  // [L] → [inter, hidden]
+    half** dW_up_proj         = nullptr;  // [L] → [inter, hidden]
+    half** dW_down_proj       = nullptr;  // [L] → [hidden, inter]
+    float** dW_input_norm     = nullptr;  // [L] → [hidden]
+    float** dW_q_norm         = nullptr;  // [L] → [head_dim]
+    float** dW_k_norm         = nullptr;  // [L] → [head_dim]
+    float** dW_post_attn_norm = nullptr;  // [L] → [hidden]
+
+    // Global weight gradients
+    half*  dW_embed      = nullptr;  // [vocab, hidden] (tied = lm_head grad)
+    float* dW_final_norm = nullptr;  // [hidden]
+
+    // Backward workspace
+    float* D_buf         = nullptr;  // [max_T * H_q] for flash attention backward
+};
+
+Qwen3Gradients* qwen3_gradients_alloc(const Qwen3Config& c, int max_T);
+void qwen3_gradients_free(Qwen3Gradients* g);
+void qwen3_gradients_zero(Qwen3Gradients* g, cudaStream_t stream = 0);
+
+// Training backward pass.
+// Computes weight gradients given upstream d_log_probs gradient.
+// Gradients are accumulated into grads (caller must zero before first call).
+// Uses model scratch buffers (d_hidden, d_Q, etc.) as workspace.
+void qwen3_backward(
+    Qwen3Model* m,
+    Qwen3TrainState* state,
+    Qwen3Gradients* grads,
+    const float* d_log_probs,   // [B*S] upstream gradient (device, FP32)
+    cudaStream_t stream = 0
+);
+
+// =============================================================================
+// AdamW Optimizer
+// =============================================================================
+
+struct AdamWConfig {
+    float lr           = 1e-5f;
+    float beta1        = 0.9f;
+    float beta2        = 0.999f;
+    float eps          = 1e-8f;
+    float weight_decay = 0.01f;
+};
+
+// Optimizer state: FP32 master weights + first/second moments for all parameters.
+// Bulk-allocated in two pools (FP16 params → FP32 master+m+v; FP32 params → m+v).
+struct Qwen3AdamW {
+    AdamWConfig config;
+    int step = 0;
+    int num_layers = 0;
+
+    // --- Bulk GPU allocations ---
+    float* fp16_pool = nullptr;   // master_w + m + v for all FP16 weight params
+    float* fp32_pool = nullptr;   // m + v for all FP32 weight params (norms)
+    size_t fp16_pool_bytes = 0;
+    size_t fp32_pool_bytes = 0;
+
+    // Per-layer FP16 param optimizer state (pointers into fp16_pool)
+    // Each triple: (master_w, m, v) — same size as the weight
+    struct FP16ParamState {
+        float* master_w;
+        float* m;
+        float* v;
+    };
+    FP16ParamState* q_proj    = nullptr;  // [L]
+    FP16ParamState* k_proj    = nullptr;
+    FP16ParamState* v_proj    = nullptr;
+    FP16ParamState* o_proj    = nullptr;
+    FP16ParamState* gate_proj = nullptr;
+    FP16ParamState* up_proj   = nullptr;
+    FP16ParamState* down_proj = nullptr;
+    FP16ParamState  embed;                // single (tied = lm_head)
+
+    // Per-layer FP32 param optimizer state (pointers into fp32_pool)
+    // Each pair: (m, v) — same size as the weight
+    struct FP32ParamState {
+        float* m;
+        float* v;
+    };
+    FP32ParamState* input_norm     = nullptr;  // [L]
+    FP32ParamState* q_norm         = nullptr;
+    FP32ParamState* k_norm         = nullptr;
+    FP32ParamState* post_attn_norm = nullptr;
+    FP32ParamState  final_norm;
+};
+
+Qwen3AdamW* qwen3_adamw_alloc(const Qwen3Config& c, const Qwen3Weights& w,
+                               const AdamWConfig& config);
+void qwen3_adamw_free(Qwen3AdamW* opt);
+
+// Perform one AdamW step: updates all model weights using gradients.
+// Increments opt->step internally.
+void qwen3_adamw_step(
+    Qwen3Model* m,
+    Qwen3Gradients* grads,
+    Qwen3AdamW* opt,
+    cudaStream_t stream = 0
+);

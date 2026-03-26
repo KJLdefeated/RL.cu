@@ -52,12 +52,42 @@ $(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu | $(BUILDDIR
 $(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@
 
+$(BUILDDIR)/test_linear_backward: src/kernels/linear.cu tests/test_linear_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
+$(BUILDDIR)/test_embedding_backward: src/kernels/embedding.cu tests/test_embedding_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
+$(BUILDDIR)/test_rmsnorm_backward: src/kernels/rmsnorm.cu tests/test_rmsnorm_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
+$(BUILDDIR)/test_swiglu_backward: src/kernels/swiglu.cu tests/test_swiglu_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
+$(BUILDDIR)/test_rope_backward: src/kernels/rope.cu tests/test_rope_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
+$(BUILDDIR)/test_attention_backward: src/kernels/attention.cu tests/test_attention_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
 QWEN3_SRCS := src/model/qwen3.cu src/model/kv_cache.cu \
               src/kernels/rmsnorm.cu src/kernels/rope.cu src/kernels/attention.cu \
               src/kernels/swiglu.cu src/kernels/embedding.cu src/kernels/linear.cu \
               src/kernels/config.cpp src/kernels/weights.cpp
 
 $(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
+$(BUILDDIR)/test_qwen3_forward: $(QWEN3_SRCS) tests/test_qwen3_forward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
+$(BUILDDIR)/test_qwen3_backward: $(QWEN3_SRCS) tests/test_qwen3_backward.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
+$(BUILDDIR)/test_fwd_bwd: $(QWEN3_SRCS) tests/test_fwd_bwd.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
+$(BUILDDIR)/test_adamw: $(QWEN3_SRCS) src/kernels/adamw.cu tests/test_adamw.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
 
 $(BUILDDIR)/bench_decode: $(QWEN3_SRCS) tests/bench_decode.cu | $(BUILDDIR)
@@ -76,7 +106,7 @@ $(BUILDDIR):
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights bench_decode test_llmengine tests generate_refs clean
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_loading_weights bench_decode test_llmengine tests generate_refs clean
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -105,8 +135,38 @@ test_linear: $(BUILDDIR)/test_linear
 test_sampler: $(BUILDDIR)/test_sampler
 	./$(BUILDDIR)/test_sampler
 
+test_linear_backward: $(BUILDDIR)/test_linear_backward
+	./$(BUILDDIR)/test_linear_backward
+
+test_embedding_backward: $(BUILDDIR)/test_embedding_backward
+	./$(BUILDDIR)/test_embedding_backward
+
+test_rmsnorm_backward: $(BUILDDIR)/test_rmsnorm_backward
+	./$(BUILDDIR)/test_rmsnorm_backward
+
+test_swiglu_backward: $(BUILDDIR)/test_swiglu_backward
+	./$(BUILDDIR)/test_swiglu_backward
+
+test_rope_backward: $(BUILDDIR)/test_rope_backward
+	./$(BUILDDIR)/test_rope_backward
+
+test_attention_backward: $(BUILDDIR)/test_attention_backward
+	./$(BUILDDIR)/test_attention_backward
+
 test_qwen3: $(BUILDDIR)/test_qwen3
 	./$(BUILDDIR)/test_qwen3
+
+test_qwen3_forward: $(BUILDDIR)/test_qwen3_forward
+	./$(BUILDDIR)/test_qwen3_forward
+
+test_qwen3_backward: $(BUILDDIR)/test_qwen3_backward
+	./$(BUILDDIR)/test_qwen3_backward
+
+test_fwd_bwd: $(BUILDDIR)/test_fwd_bwd
+	./$(BUILDDIR)/test_fwd_bwd
+
+test_adamw: $(BUILDDIR)/test_adamw
+	./$(BUILDDIR)/test_adamw
 
 test_loading_weights: $(BUILDDIR)/test_loading_weights
 	./$(BUILDDIR)/test_loading_weights

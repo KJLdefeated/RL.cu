@@ -86,13 +86,75 @@ void launch_rope(
     int          head_dim,
     cudaStream_t stream
 ) {
-    // Grid: one block per (token, Q head)
-    // Block: head_dim/2 threads (one per rotation pair)
     dim3 grid(num_tokens, num_q_heads);
     dim3 block(head_dim / 2);
 
     rope_kernel<<<grid, block, 0, stream>>>(
         Q, K, cos_table, sin_table, position_ids,
+        num_tokens, num_q_heads, num_kv_heads, head_dim
+    );
+}
+
+// ============================================================
+// Backward: inverse rotation (transpose of rotation matrix).
+//   dX[i]      = dOut[i]*cos + dOut[i+D/2]*sin
+//   dX[i+D/2]  = dOut[i+D/2]*cos - dOut[i]*sin
+// Same structure as forward with sin signs flipped.
+// ============================================================
+
+__global__ void rope_backward_kernel(
+    half*        __restrict__ dQ,
+    half*        __restrict__ dK,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int*   __restrict__ position_ids,
+    int num_tokens, int H_q, int H_kv, int head_dim
+) {
+    const int tok = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int i   = threadIdx.x;
+    const int hd2 = head_dim / 2;
+
+    const int pos = position_ids[tok];
+    const float c = cos_table[pos * hd2 + i];
+    const float s = sin_table[pos * hd2 + i];
+
+    // dQ: inverse rotation
+    {
+        half* dq = dQ + (tok * H_q + h) * head_dim;
+        const float dq0 = __half2float(dq[i]);
+        const float dq1 = __half2float(dq[i + hd2]);
+        dq[i]       = __float2half(dq0 * c + dq1 * s);
+        dq[i + hd2] = __float2half(dq1 * c - dq0 * s);
+    }
+
+    // dK: only for KV heads
+    if (h < H_kv) {
+        half* dk = dK + (tok * H_kv + h) * head_dim;
+        const float dk0 = __half2float(dk[i]);
+        const float dk1 = __half2float(dk[i + hd2]);
+        dk[i]       = __float2half(dk0 * c + dk1 * s);
+        dk[i + hd2] = __float2half(dk1 * c - dk0 * s);
+    }
+}
+
+void launch_rope_backward(
+    half*        dQ,
+    half*        dK,
+    const float* cos_table,
+    const float* sin_table,
+    const int*   position_ids,
+    int          num_tokens,
+    int          num_q_heads,
+    int          num_kv_heads,
+    int          head_dim,
+    cudaStream_t stream
+) {
+    dim3 grid(num_tokens, num_q_heads);
+    dim3 block(head_dim / 2);
+
+    rope_backward_kernel<<<grid, block, 0, stream>>>(
+        dQ, dK, cos_table, sin_table, position_ids,
         num_tokens, num_q_heads, num_kv_heads, head_dim
     );
 }

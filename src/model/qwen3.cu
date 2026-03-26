@@ -9,6 +9,7 @@
 #include "kernels/rope.cuh"
 #include "kernels/swiglu.cuh"
 #include "kernels/linear.cuh"
+#include "kernels/adamw.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -69,6 +70,161 @@ __global__ static void gather_at_offsets_kernel(
     half*       dst = out + (long)b * hidden_size;
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x)
         dst[d] = src[d];
+}
+
+// =============================================================================
+// Log-softmax + gather kernel (for training forward)
+//
+// For each token t, computes:
+//   log_probs[t] = logits[t, target[t]] - max - log(sum(exp(logits[t] - max)))
+//
+// Grid:  (num_tokens,)
+// Block: (256)
+// =============================================================================
+
+__global__ static void log_softmax_gather_kernel(
+    float*       __restrict__ log_probs,    // [T]
+    const half*  __restrict__ logits,       // [T, V]
+    const int*   __restrict__ targets,      // [T]
+    int V
+) {
+    const int t = blockIdx.x;
+    const half* row = logits + (long)t * V;
+    const int target = targets[t];
+
+    // Step 1: Find row max (warp shuffle + shared memory reduction)
+    float local_max = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float v = __half2float(row[i]);
+        if (v > local_max) local_max = v;
+    }
+
+    // Warp-level max reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
+
+    // Inter-warp reduction via shared memory
+    __shared__ float smem[32];
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int num_warps = blockDim.x / 32;
+
+    if (lane == 0) smem[warp] = local_max;
+    __syncthreads();
+    // All threads in warp 0 must participate in shuffle (avoid UB with partial warp)
+    if (warp == 0) {
+        float val = (lane < num_warps) ? smem[lane] : -INFINITY;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    const float global_max = smem[0];
+
+    // Step 2: Sum of exp(x - max)
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+        local_sum += expf(__half2float(row[i]) - global_max);
+
+    // Warp-level sum reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset);
+
+    if (lane == 0) smem[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0) {
+        float val = (lane < num_warps) ? smem[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    const float global_sum = smem[0];
+
+    // Step 3: log_prob = logit[target] - max - log(sum)
+    if (threadIdx.x == 0) {
+        log_probs[t] = __half2float(row[target]) - global_max - logf(global_sum);
+    }
+}
+
+// =============================================================================
+// Log-softmax + gather BACKWARD kernel
+//
+// Overwrites d_logits in-place: reads logits, writes gradients.
+//   d_logits[t, v] = d_loss[t] * (1_{v == target[t]} - softmax(logits[t])[v])
+//
+// Grid:  (num_tokens,)
+// Block: (256)
+// =============================================================================
+
+__global__ static void log_softmax_gather_backward_kernel(
+    half*        __restrict__ d_logits,    // [n, V] in: logits, out: gradients
+    const float* __restrict__ d_loss,      // [n] upstream gradient
+    const int*   __restrict__ targets,     // [n]
+    int V
+) {
+    const int t = blockIdx.x;
+    half* row = d_logits + (long)t * V;
+    const float dl = d_loss[t];
+    const int target = targets[t];
+
+    // Step 1: Row max
+    float local_max = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+        local_max = fmaxf(local_max, __half2float(row[i]));
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, off));
+
+    __shared__ float smem[32];
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int num_warps = blockDim.x / 32;
+
+    if (lane == 0) smem[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        float val = (lane < num_warps) ? smem[lane] : -INFINITY;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, off));
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    const float global_max = smem[0];
+
+    // Step 2: Sum of exp(logit - max)
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+        local_sum += expf(__half2float(row[i]) - global_max);
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, off);
+
+    if (lane == 0) smem[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0) {
+        float val = (lane < num_warps) ? smem[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            val += __shfl_xor_sync(0xFFFFFFFF, val, off);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    const float inv_sum = 1.0f / smem[0];
+
+    // Step 3: Write gradients (all reads of logits complete before any write)
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float softmax_i = expf(__half2float(row[i]) - global_max) * inv_sum;
+        float grad = dl * ((i == target ? 1.0f : 0.0f) - softmax_i);
+        row[i] = __float2half(grad);
+    }
 }
 
 // =============================================================================
@@ -476,4 +632,869 @@ half* qwen3_decode(Qwen3Model* m, const std::vector<Sequence*>& batch,
     compute_logits(m, B, /*S=*/1, stream);
 
     return m->d_logits;
+}
+
+// =============================================================================
+// Training: state allocation / free
+// =============================================================================
+
+Qwen3TrainState* qwen3_train_state_alloc(const Qwen3Config& c, int B, int S) {
+    auto* s = new Qwen3TrainState{};
+    s->B = B;  s->S = S;  s->T = B * S;
+    s->num_layers = c.num_hidden_layers;
+    const int T = s->T;
+    const int L = s->num_layers;
+
+    // Per-layer element counts (half)
+    const long input_sz = (long)T * c.hidden_size;
+    const long qraw_sz  = (long)T * c.q_dim;
+    const long kraw_sz  = (long)T * c.kv_dim;
+    const long q_sz     = (long)T * c.q_dim;
+    const long k_sz     = (long)T * c.kv_dim;
+    const long v_sz     = (long)T * c.kv_dim;
+    const long o_sz     = (long)T * c.q_dim;
+    const long pattn_sz = (long)T * c.hidden_size;
+    const long gate_sz  = (long)T * c.intermediate_size;
+    const long up_sz    = (long)T * c.intermediate_size;
+    const long final_sz = (long)T * c.hidden_size;
+
+    const long per_layer_halfs = input_sz + qraw_sz + kraw_sz + q_sz + k_sz
+                               + v_sz + o_sz + pattn_sz + gate_sz + up_sz;
+    const long total_halfs = per_layer_halfs * L + final_sz;
+
+    // Per-layer element counts (float) — LSE: [B, S, H_q] = [T, H_q]
+    const long lse_per_layer = (long)T * c.num_attention_heads;
+    const long total_floats  = lse_per_layer * L;
+
+    // Allocate GPU pools
+    CUDA_CHECK(cudaMalloc(&s->activation_pool, total_halfs * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&s->lse_pool, total_floats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s->d_token_ids,  T * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_target_ids, T * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_pos_ids,    T * sizeof(int)));
+
+    // Allocate host pointer arrays
+    s->layer_input     = new half*[L];
+    s->layer_Q_raw     = new half*[L];
+    s->layer_K_raw     = new half*[L];
+    s->layer_Q         = new half*[L];
+    s->layer_K         = new half*[L];
+    s->layer_V         = new half*[L];
+    s->layer_O         = new half*[L];
+    s->layer_post_attn = new half*[L];
+    s->layer_gate      = new half*[L];
+    s->layer_up        = new half*[L];
+    s->layer_lse       = new float*[L];
+
+    // Partition half pool into per-layer buffers
+    half* p = s->activation_pool;
+    for (int l = 0; l < L; l++) {
+        s->layer_input[l]     = p;  p += input_sz;
+        s->layer_Q_raw[l]     = p;  p += qraw_sz;
+        s->layer_K_raw[l]     = p;  p += kraw_sz;
+        s->layer_Q[l]         = p;  p += q_sz;
+        s->layer_K[l]         = p;  p += k_sz;
+        s->layer_V[l]         = p;  p += v_sz;
+        s->layer_O[l]         = p;  p += o_sz;
+        s->layer_post_attn[l] = p;  p += pattn_sz;
+        s->layer_gate[l]      = p;  p += gate_sz;
+        s->layer_up[l]        = p;  p += up_sz;
+    }
+    s->final_hidden = p;  // last chunk: [T, hidden]
+
+    // Partition float pool into per-layer LSE
+    float* fp = s->lse_pool;
+    for (int l = 0; l < L; l++) {
+        s->layer_lse[l] = fp;  fp += lse_per_layer;
+    }
+
+    printf("[TrainState] Allocated: B=%d S=%d T=%d  activations=%.1f MB  LSE=%.2f MB\n",
+           B, S, T,
+           total_halfs * sizeof(half) / (1024.0 * 1024.0),
+           total_floats * sizeof(float) / (1024.0 * 1024.0));
+
+    return s;
+}
+
+void qwen3_train_state_free(Qwen3TrainState* s) {
+    if (!s) return;
+    cudaFree(s->activation_pool);
+    cudaFree(s->lse_pool);
+    cudaFree(s->d_token_ids);
+    cudaFree(s->d_target_ids);
+    cudaFree(s->d_pos_ids);
+    delete[] s->layer_input;
+    delete[] s->layer_Q_raw;
+    delete[] s->layer_K_raw;
+    delete[] s->layer_Q;
+    delete[] s->layer_K;
+    delete[] s->layer_V;
+    delete[] s->layer_O;
+    delete[] s->layer_post_attn;
+    delete[] s->layer_gate;
+    delete[] s->layer_up;
+    delete[] s->layer_lse;
+    delete s;
+}
+
+// =============================================================================
+// Training forward pass
+// =============================================================================
+
+void qwen3_forward(
+    Qwen3Model*      m,
+    Qwen3TrainState* state,
+    const int*       h_token_ids,   // [B*S] host
+    const int*       h_target_ids,  // [B*S] host
+    float*           d_log_probs,   // [B*S] device output
+    int B, int S,
+    cudaStream_t     stream
+) {
+    const Qwen3Config& c = m->config;
+    const int T = B * S;
+    state->B = B;  state->S = S;  state->T = T;
+
+    // --- Upload token IDs, target IDs, position IDs ---
+    CUDA_CHECK(cudaMemcpyAsync(state->d_token_ids, h_token_ids,
+                               T * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(state->d_target_ids, h_target_ids,
+                               T * sizeof(int), cudaMemcpyHostToDevice, stream));
+
+    // Position IDs: 0..S-1 repeated for each batch element
+    {
+        std::vector<int> h_pos(T);
+        for (int b = 0; b < B; b++)
+            for (int s = 0; s < S; s++)
+                h_pos[b * S + s] = s;
+        CUDA_CHECK(cudaMemcpyAsync(state->d_pos_ids, h_pos.data(),
+                                   T * sizeof(int), cudaMemcpyHostToDevice, stream));
+    }
+
+    CUBLAS_CHECK(cublasSetStream(m->cublas, stream));
+
+    // --- Embedding ---
+    launch_embedding(m->d_hidden, m->weights.embed_tokens,
+                     state->d_token_ids, T, c.vocab_size, c.hidden_size, stream);
+
+    // --- Transformer layers ---
+    for (int l = 0; l < c.num_hidden_layers; l++) {
+        const Qwen3LayerWeights& L = m->weights.layers[l];
+
+        // Save input hidden state (= residual for this layer)
+        CUDA_CHECK(cudaMemcpyAsync(state->layer_input[l], m->d_hidden,
+                                   (long)T * c.hidden_size * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+
+        // Input RMSNorm: d_hidden = norm(layer_input)
+        launch_rmsnorm(m->d_hidden, state->layer_input[l],
+                       L.input_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
+
+        // QKV projections → save raw Q, K into state; V directly into state
+        linear_half(m->cublas, m->d_hidden, L.q_proj,
+                    state->layer_Q_raw[l], T, c.q_dim, c.hidden_size);
+        linear_half(m->cublas, m->d_hidden, L.k_proj,
+                    state->layer_K_raw[l], T, c.kv_dim, c.hidden_size);
+        linear_half(m->cublas, m->d_hidden, L.v_proj,
+                    state->layer_V[l],     T, c.kv_dim, c.hidden_size);
+
+        // QK-Norm: Q_raw → Q, K_raw → K  (separate in/out, no copy needed)
+        launch_rmsnorm(state->layer_Q[l], state->layer_Q_raw[l],
+                       L.q_norm, T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
+        launch_rmsnorm(state->layer_K[l], state->layer_K_raw[l],
+                       L.k_norm, T * c.num_key_value_heads, c.head_dim, c.rms_norm_eps, stream);
+
+        // RoPE in-place on Q, K (state buffers)
+        launch_rope(state->layer_Q[l], state->layer_K[l],
+                    m->cos_table, m->sin_table, state->d_pos_ids,
+                    T, c.num_attention_heads, c.num_key_value_heads, c.head_dim, stream);
+
+        // Flash Attention 2 prefill (no KV cache) — saves LSE for backward
+        launch_flash_attention_prefill(
+            state->layer_Q[l], state->layer_K[l], state->layer_V[l],
+            state->layer_O[l],
+            B, S, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+            stream, state->layer_lse[l]);
+
+        // O projection + residual
+        linear_half(m->cublas, state->layer_O[l], L.o_proj,
+                    m->d_hidden, T, c.hidden_size, c.q_dim);
+        add_residual(m->d_hidden, state->layer_input[l], T * c.hidden_size, stream);
+
+        // Save post-attention hidden (residual for MLP block)
+        CUDA_CHECK(cudaMemcpyAsync(state->layer_post_attn[l], m->d_hidden,
+                                   (long)T * c.hidden_size * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+
+        // Post-attention RMSNorm
+        launch_rmsnorm(m->d_hidden, state->layer_post_attn[l],
+                       L.post_attn_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
+
+        // Gate/Up projections → save into state
+        linear_half(m->cublas, m->d_hidden, L.gate_proj,
+                    state->layer_gate[l], T, c.intermediate_size, c.hidden_size);
+        linear_half(m->cublas, m->d_hidden, L.up_proj,
+                    state->layer_up[l],   T, c.intermediate_size, c.hidden_size);
+
+        // SwiGLU → scratch d_mlp_mid (not saved; recomputable from gate+up)
+        launch_swiglu(m->d_mlp_mid, state->layer_gate[l], state->layer_up[l],
+                      T * c.intermediate_size, stream);
+
+        // Down projection + residual
+        linear_half(m->cublas, m->d_mlp_mid, L.down_proj,
+                    m->d_hidden, T, c.hidden_size, c.intermediate_size);
+        add_residual(m->d_hidden, state->layer_post_attn[l], T * c.hidden_size, stream);
+    }
+
+    // --- Save final hidden state (before final_norm) ---
+    CUDA_CHECK(cudaMemcpyAsync(state->final_hidden, m->d_hidden,
+                               (long)T * c.hidden_size * sizeof(half),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    // --- Final RMSNorm → d_residual (scratch) ---
+    launch_rmsnorm(m->d_residual, state->final_hidden,
+                   m->weights.final_norm, T, c.hidden_size, c.rms_norm_eps, stream);
+
+    // --- LM head + log-softmax in chunks ---
+    // d_logits is [max_batch, vocab_size] — process at most max_batch tokens per chunk.
+    const int chunk = m->max_batch;
+    for (int start = 0; start < T; start += chunk) {
+        const int n = (start + chunk <= T) ? chunk : (T - start);
+
+        // Project [n, hidden] → [n, vocab]
+        linear_half(m->cublas,
+                    m->d_residual + (long)start * c.hidden_size,
+                    m->weights.lm_head,
+                    m->d_logits, n, c.vocab_size, c.hidden_size);
+
+        // Log-softmax + gather target log-prob
+        log_softmax_gather_kernel<<<n, 256, 0, stream>>>(
+            d_log_probs + start,
+            m->d_logits,
+            state->d_target_ids + start,
+            c.vocab_size);
+    }
+}
+
+// =============================================================================
+// Gradient allocation / free / zero
+// =============================================================================
+
+Qwen3Gradients* qwen3_gradients_alloc(const Qwen3Config& c, int max_T) {
+    auto* g = new Qwen3Gradients{};
+    g->num_layers = c.num_hidden_layers;
+    const int L = g->num_layers;
+    const int H = c.hidden_size;
+
+    // Per-layer half sizes
+    const long q_proj_sz    = (long)c.q_dim * H;
+    const long k_proj_sz    = (long)c.kv_dim * H;
+    const long v_proj_sz    = (long)c.kv_dim * H;
+    const long o_proj_sz    = (long)H * c.q_dim;
+    const long gate_proj_sz = (long)c.intermediate_size * H;
+    const long up_proj_sz   = (long)c.intermediate_size * H;
+    const long down_proj_sz = (long)H * c.intermediate_size;
+    const long per_layer_halfs = q_proj_sz + k_proj_sz + v_proj_sz + o_proj_sz
+                                + gate_proj_sz + up_proj_sz + down_proj_sz;
+    const long embed_sz     = (long)c.vocab_size * H;
+    const long total_halfs  = per_layer_halfs * L + embed_sz;
+
+    // Per-layer float sizes
+    const long per_layer_floats = (long)H + c.head_dim + c.head_dim + H;
+    const long final_norm_sz    = H;
+    const long d_buf_sz         = (long)max_T * c.num_attention_heads;
+    const long total_floats     = per_layer_floats * L + final_norm_sz + d_buf_sz;
+
+    g->half_pool_bytes  = total_halfs * sizeof(half);
+    g->float_pool_bytes = total_floats * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&g->half_pool,  g->half_pool_bytes));
+    CUDA_CHECK(cudaMalloc(&g->float_pool, g->float_pool_bytes));
+
+    // Allocate host pointer arrays
+    g->dW_q_proj          = new half*[L];
+    g->dW_k_proj          = new half*[L];
+    g->dW_v_proj          = new half*[L];
+    g->dW_o_proj          = new half*[L];
+    g->dW_gate_proj       = new half*[L];
+    g->dW_up_proj         = new half*[L];
+    g->dW_down_proj       = new half*[L];
+    g->dW_input_norm      = new float*[L];
+    g->dW_q_norm          = new float*[L];
+    g->dW_k_norm          = new float*[L];
+    g->dW_post_attn_norm  = new float*[L];
+
+    // Partition half pool
+    half* hp = g->half_pool;
+    for (int l = 0; l < L; l++) {
+        g->dW_q_proj[l]    = hp; hp += q_proj_sz;
+        g->dW_k_proj[l]    = hp; hp += k_proj_sz;
+        g->dW_v_proj[l]    = hp; hp += v_proj_sz;
+        g->dW_o_proj[l]    = hp; hp += o_proj_sz;
+        g->dW_gate_proj[l] = hp; hp += gate_proj_sz;
+        g->dW_up_proj[l]   = hp; hp += up_proj_sz;
+        g->dW_down_proj[l] = hp; hp += down_proj_sz;
+    }
+    g->dW_embed = hp;
+
+    // Partition float pool
+    float* fp = g->float_pool;
+    for (int l = 0; l < L; l++) {
+        g->dW_input_norm[l]     = fp; fp += H;
+        g->dW_q_norm[l]         = fp; fp += c.head_dim;
+        g->dW_k_norm[l]         = fp; fp += c.head_dim;
+        g->dW_post_attn_norm[l] = fp; fp += H;
+    }
+    g->dW_final_norm = fp; fp += final_norm_sz;
+    g->D_buf         = fp;
+
+    printf("[Gradients] Allocated: half=%.1f MB  float=%.2f MB\n",
+           g->half_pool_bytes / (1024.0 * 1024.0),
+           g->float_pool_bytes / (1024.0 * 1024.0));
+
+    return g;
+}
+
+void qwen3_gradients_free(Qwen3Gradients* g) {
+    if (!g) return;
+    cudaFree(g->half_pool);
+    cudaFree(g->float_pool);
+    delete[] g->dW_q_proj;
+    delete[] g->dW_k_proj;
+    delete[] g->dW_v_proj;
+    delete[] g->dW_o_proj;
+    delete[] g->dW_gate_proj;
+    delete[] g->dW_up_proj;
+    delete[] g->dW_down_proj;
+    delete[] g->dW_input_norm;
+    delete[] g->dW_q_norm;
+    delete[] g->dW_k_norm;
+    delete[] g->dW_post_attn_norm;
+    delete g;
+}
+
+void qwen3_gradients_zero(Qwen3Gradients* g, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(g->half_pool,  0, g->half_pool_bytes,  stream));
+    CUDA_CHECK(cudaMemsetAsync(g->float_pool, 0, g->float_pool_bytes, stream));
+}
+
+// =============================================================================
+// Training backward pass
+// =============================================================================
+
+void qwen3_backward(
+    Qwen3Model*      m,
+    Qwen3TrainState* state,
+    Qwen3Gradients*  grads,
+    const float*     d_log_probs,   // [B*S] device, FP32
+    cudaStream_t     stream
+) {
+    const Qwen3Config& c = m->config;
+    const int T = state->T, B = state->B, S = state->S;
+    const int H = c.hidden_size;
+    const int V = c.vocab_size;
+
+    CUBLAS_CHECK(cublasSetStream(m->cublas, stream));
+
+    // ================================================================
+    // Phase 1: lm_head + log_softmax backward (chunked)
+    // ================================================================
+
+    // Recompute normed final hidden → d_residual
+    launch_rmsnorm(m->d_residual, state->final_hidden,
+                   m->weights.final_norm, T, H, c.rms_norm_eps, stream);
+
+    // Zero d_hidden (accumulate gradient for normed final hidden)
+    CUDA_CHECK(cudaMemsetAsync(m->d_hidden, 0, (long)T * H * sizeof(half), stream));
+
+    const int chunk = m->max_batch;
+    for (int start = 0; start < T; start += chunk) {
+        const int n = (start + chunk <= T) ? chunk : (T - start);
+
+        // Recompute logits for this chunk
+        linear_half(m->cublas,
+                    m->d_residual + (long)start * H,
+                    m->weights.lm_head,
+                    m->d_logits, n, V, H);
+
+        // Backward log_softmax_gather: overwrite d_logits with gradients
+        log_softmax_gather_backward_kernel<<<n, 256, 0, stream>>>(
+            m->d_logits,
+            d_log_probs + start,
+            state->d_target_ids + start,
+            V);
+
+        // lm_head backward: dX → d_gate (scratch), dW → dW_embed (accumulated)
+        linear_backward_half(m->cublas,
+            m->d_logits,                           // dY [n, V]
+            m->d_residual + (long)start * H,       // X  [n, H]
+            m->weights.lm_head,                    // W  [V, H]
+            m->d_gate,                             // dX [n, H] scratch
+            grads->dW_embed,                       // dW [V, H] accumulated
+            n, V, H);
+
+        // Accumulate dX into d_hidden
+        add_residual(m->d_hidden + (long)start * H, m->d_gate, n * H, stream);
+    }
+
+    // ================================================================
+    // Phase 2: final_norm backward
+    // ================================================================
+
+    launch_rmsnorm_backward(
+        m->d_residual,                // dX [T, H]
+        grads->dW_final_norm,         // dW [H]
+        m->d_hidden,                  // dY [T, H]
+        state->final_hidden,          // x  [T, H] (saved input)
+        m->weights.final_norm,        // w  [H]
+        T, H, c.rms_norm_eps, stream);
+
+    // d_residual = gradient w.r.t. final_hidden → move to d_hidden
+    CUDA_CHECK(cudaMemcpyAsync(m->d_hidden, m->d_residual,
+                               (long)T * H * sizeof(half),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    // ================================================================
+    // Phase 3: Transformer layers backward (reverse order)
+    // ================================================================
+
+    for (int l = c.num_hidden_layers - 1; l >= 0; l--) {
+        const Qwen3LayerWeights& LW = m->weights.layers[l];
+
+        // Save d_output for residual path
+        CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden,
+                                   (long)T * H * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+
+        // ---- MLP backward ----
+
+        // Recompute mlp_mid = swiglu(gate[l], up[l])
+        launch_swiglu(m->d_mlp_mid, state->layer_gate[l], state->layer_up[l],
+                      T * c.intermediate_size, stream);
+
+        // down_proj backward
+        linear_backward_half(m->cublas,
+            m->d_hidden,                        // dY [T, H]
+            m->d_mlp_mid,                       // X  [T, inter] (recomputed)
+            LW.down_proj,                       // W  [H, inter]
+            m->d_up,                            // dX [T, inter]
+            grads->dW_down_proj[l],             // dW [H, inter]
+            T, H, c.intermediate_size);
+
+        // SwiGLU backward: dOut=d_up → dGate=d_gate, dUp=d_mlp_mid
+        launch_swiglu_backward(
+            m->d_gate,                          // dGate [T, inter]
+            m->d_mlp_mid,                       // dUp   [T, inter]
+            m->d_up,                            // dOut  [T, inter]
+            state->layer_gate[l],               // saved gate
+            state->layer_up[l],                 // saved up
+            T * c.intermediate_size, stream);
+
+        // Recompute normed post_attn → d_K (scratch [T, H]; kv_dim=H)
+        launch_rmsnorm(m->d_K, state->layer_post_attn[l],
+                       LW.post_attn_layernorm, T, H, c.rms_norm_eps, stream);
+
+        // gate_proj backward: dX → d_Q
+        linear_backward_half(m->cublas,
+            m->d_gate,                          // dY [T, inter]
+            m->d_K,                             // X  [T, H] (normed post_attn)
+            LW.gate_proj,                       // W  [inter, H]
+            m->d_Q,                             // dX [T, H]
+            grads->dW_gate_proj[l],             // dW [inter, H]
+            T, c.intermediate_size, H);
+
+        // up_proj backward: dX → d_V
+        linear_backward_half(m->cublas,
+            m->d_mlp_mid,                       // dY [T, inter] (=dUp)
+            m->d_K,                             // X  [T, H]
+            LW.up_proj,                         // W  [inter, H]
+            m->d_V,                             // dX [T, H]
+            grads->dW_up_proj[l],               // dW [inter, H]
+            T, c.intermediate_size, H);
+
+        // Sum gate + up dX → d_hidden
+        CUDA_CHECK(cudaMemcpyAsync(m->d_hidden, m->d_Q,
+                                   (long)T * H * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+        add_residual(m->d_hidden, m->d_V, T * H, stream);
+
+        // post_attn_norm backward
+        launch_rmsnorm_backward(
+            m->d_Q,                             // dX [T, H]
+            grads->dW_post_attn_norm[l],        // dW [H]
+            m->d_hidden,                        // dY [T, H]
+            state->layer_post_attn[l],          // x  [T, H]
+            LW.post_attn_layernorm,             // w  [H]
+            T, H, c.rms_norm_eps, stream);
+
+        // Add MLP residual
+        add_residual(m->d_Q, m->d_residual, T * H, stream);
+
+        // ---- Attention backward ----
+
+        // Save d_post_attn_total for attention residual
+        CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_Q,
+                                   (long)T * H * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+
+        // o_proj backward: dX → d_attn_out (= dO for flash attention)
+        linear_backward_half(m->cublas,
+            m->d_Q,                             // dY [T, H]
+            state->layer_O[l],                  // X  [T, q_dim]
+            LW.o_proj,                          // W  [H, q_dim]
+            m->d_attn_out,                      // dX [T, q_dim] = dO
+            grads->dW_o_proj[l],                // dW [H, q_dim]
+            T, H, c.q_dim);
+
+        // Flash attention backward
+        launch_flash_attention_backward(
+            state->layer_Q[l], state->layer_K[l], state->layer_V[l],
+            state->layer_O[l],
+            m->d_attn_out,                      // dO [T, q_dim]
+            state->layer_lse[l],
+            grads->D_buf,
+            m->d_Q,                             // dQ [T, q_dim]
+            m->d_K,                             // dK [T, kv_dim]
+            m->d_V,                             // dV [T, kv_dim]
+            B, S, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+            stream);
+
+        // RoPE backward (in-place on dQ, dK)
+        launch_rope_backward(m->d_Q, m->d_K,
+                            m->cos_table, m->sin_table, state->d_pos_ids,
+                            T, c.num_attention_heads, c.num_key_value_heads,
+                            c.head_dim, stream);
+
+        // QK-norm backward (Q): dX → d_attn_out
+        launch_rmsnorm_backward(
+            m->d_attn_out,                      // dX [T, q_dim]
+            grads->dW_q_norm[l],                // dW [head_dim]
+            m->d_Q,                             // dY [T, q_dim]
+            state->layer_Q_raw[l],              // x
+            LW.q_norm,                          // w  [head_dim]
+            T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
+
+        // QK-norm backward (K): dX → d_mlp_mid (scratch)
+        launch_rmsnorm_backward(
+            m->d_mlp_mid,                       // dX [T, kv_dim]
+            grads->dW_k_norm[l],                // dW [head_dim]
+            m->d_K,                             // dY [T, kv_dim]
+            state->layer_K_raw[l],              // x
+            LW.k_norm,                          // w  [head_dim]
+            T * c.num_key_value_heads, c.head_dim, c.rms_norm_eps, stream);
+
+        // Recompute normed input → d_gate (scratch [T, H])
+        launch_rmsnorm(m->d_gate, state->layer_input[l],
+                       LW.input_layernorm, T, H, c.rms_norm_eps, stream);
+
+        // Q proj backward: dX → d_hidden
+        linear_backward_half(m->cublas,
+            m->d_attn_out,                      // dY [T, q_dim] (=dQ_raw)
+            m->d_gate,                          // X  [T, H] (normed input)
+            LW.q_proj,                          // W  [q_dim, H]
+            m->d_hidden,                        // dX [T, H]
+            grads->dW_q_proj[l],                // dW [q_dim, H]
+            T, c.q_dim, H);
+
+        // K proj backward: dX → d_Q (scratch), then accumulate
+        linear_backward_half(m->cublas,
+            m->d_mlp_mid,                       // dY [T, kv_dim] (=dK_raw)
+            m->d_gate,                          // X  [T, H]
+            LW.k_proj,                          // W  [kv_dim, H]
+            m->d_Q,                             // dX [T, H] scratch
+            grads->dW_k_proj[l],                // dW [kv_dim, H]
+            T, c.kv_dim, H);
+        add_residual(m->d_hidden, m->d_Q, T * H, stream);
+
+        // V proj backward: dX → d_Q (scratch), then accumulate
+        linear_backward_half(m->cublas,
+            m->d_V,                             // dY [T, kv_dim]
+            m->d_gate,                          // X  [T, H]
+            LW.v_proj,                          // W  [kv_dim, H]
+            m->d_Q,                             // dX [T, H] scratch
+            grads->dW_v_proj[l],                // dW [kv_dim, H]
+            T, c.kv_dim, H);
+        add_residual(m->d_hidden, m->d_Q, T * H, stream);
+
+        // input_norm backward
+        launch_rmsnorm_backward(
+            m->d_Q,                             // dX [T, H]
+            grads->dW_input_norm[l],            // dW [H]
+            m->d_hidden,                        // dY [T, H]
+            state->layer_input[l],              // x  [T, H]
+            LW.input_layernorm,                 // w  [H]
+            T, H, c.rms_norm_eps, stream);
+
+        // Add attention residual
+        add_residual(m->d_Q, m->d_residual, T * H, stream);
+
+        // Move to d_hidden for next layer
+        CUDA_CHECK(cudaMemcpyAsync(m->d_hidden, m->d_Q,
+                                   (long)T * H * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // ================================================================
+    // Phase 4: Embedding backward
+    // ================================================================
+
+    launch_embedding_backward(
+        grads->dW_embed,               // dW [V, H] (accumulated on top of lm_head grad)
+        m->d_hidden,                   // dOut [T, H]
+        state->d_token_ids,            // token_ids [T]
+        T, H, stream);
+}
+
+// =============================================================================
+// AdamW Optimizer
+// =============================================================================
+
+// Helper: copy FP16 weights to FP32 master copy
+__global__ static void fp16_to_fp32_kernel(
+    float*      __restrict__ dst,
+    const half* __restrict__ src,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
+}
+
+static void fp16_to_fp32(float* dst, const half* src, int n, cudaStream_t stream) {
+    fp16_to_fp32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(dst, src, n);
+}
+
+Qwen3AdamW* qwen3_adamw_alloc(const Qwen3Config& c, const Qwen3Weights& w,
+                                const AdamWConfig& config) {
+    auto* opt = new Qwen3AdamW{};
+    opt->config = config;
+    opt->step = 0;
+    opt->num_layers = c.num_hidden_layers;
+    const int L = opt->num_layers;
+    const int H = c.hidden_size;
+
+    // FP16 param sizes
+    const long q_proj_sz    = (long)c.q_dim * H;
+    const long k_proj_sz    = (long)c.kv_dim * H;
+    const long v_proj_sz    = (long)c.kv_dim * H;
+    const long o_proj_sz    = (long)H * c.q_dim;
+    const long gate_proj_sz = (long)c.intermediate_size * H;
+    const long up_proj_sz   = (long)c.intermediate_size * H;
+    const long down_proj_sz = (long)H * c.intermediate_size;
+    const long per_layer_fp16 = q_proj_sz + k_proj_sz + v_proj_sz + o_proj_sz
+                               + gate_proj_sz + up_proj_sz + down_proj_sz;
+    const long embed_sz = (long)c.vocab_size * H;
+    const long total_fp16_params = per_layer_fp16 * L + embed_sz;
+
+    // FP32 param sizes
+    const long per_layer_fp32 = (long)H + c.head_dim + c.head_dim + H;
+    const long final_norm_sz = H;
+    const long total_fp32_params = per_layer_fp32 * L + final_norm_sz;
+
+    // Allocate: 3x for FP16 (master_w + m + v), 2x for FP32 (m + v)
+    opt->fp16_pool_bytes = (size_t)total_fp16_params * 3 * sizeof(float);
+    opt->fp32_pool_bytes = (size_t)total_fp32_params * 2 * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&opt->fp16_pool, opt->fp16_pool_bytes));
+    CUDA_CHECK(cudaMalloc(&opt->fp32_pool, opt->fp32_pool_bytes));
+
+    // Zero m and v (master_w will be initialized from model weights below)
+    CUDA_CHECK(cudaMemset(opt->fp16_pool, 0, opt->fp16_pool_bytes));
+    CUDA_CHECK(cudaMemset(opt->fp32_pool, 0, opt->fp32_pool_bytes));
+
+    // Allocate host pointer arrays
+    opt->q_proj    = new Qwen3AdamW::FP16ParamState[L];
+    opt->k_proj    = new Qwen3AdamW::FP16ParamState[L];
+    opt->v_proj    = new Qwen3AdamW::FP16ParamState[L];
+    opt->o_proj    = new Qwen3AdamW::FP16ParamState[L];
+    opt->gate_proj = new Qwen3AdamW::FP16ParamState[L];
+    opt->up_proj   = new Qwen3AdamW::FP16ParamState[L];
+    opt->down_proj = new Qwen3AdamW::FP16ParamState[L];
+
+    opt->input_norm     = new Qwen3AdamW::FP32ParamState[L];
+    opt->q_norm         = new Qwen3AdamW::FP32ParamState[L];
+    opt->k_norm         = new Qwen3AdamW::FP32ParamState[L];
+    opt->post_attn_norm = new Qwen3AdamW::FP32ParamState[L];
+
+    // Partition FP16 pool: [master_w_all | m_all | v_all]
+    float* fp16_master = opt->fp16_pool;
+    float* fp16_m      = fp16_master + total_fp16_params;
+    float* fp16_v      = fp16_m + total_fp16_params;
+
+    // Helper: assign (master, m, v) for a FP16 param and advance pointers
+    auto assign_fp16 = [&](Qwen3AdamW::FP16ParamState& ps, long sz) {
+        ps.master_w = fp16_master;  fp16_master += sz;
+        ps.m        = fp16_m;       fp16_m      += sz;
+        ps.v        = fp16_v;       fp16_v      += sz;
+    };
+
+    for (int l = 0; l < L; l++) {
+        assign_fp16(opt->q_proj[l],    q_proj_sz);
+        assign_fp16(opt->k_proj[l],    k_proj_sz);
+        assign_fp16(opt->v_proj[l],    v_proj_sz);
+        assign_fp16(opt->o_proj[l],    o_proj_sz);
+        assign_fp16(opt->gate_proj[l], gate_proj_sz);
+        assign_fp16(opt->up_proj[l],   up_proj_sz);
+        assign_fp16(opt->down_proj[l], down_proj_sz);
+    }
+    assign_fp16(opt->embed, embed_sz);
+
+    // Partition FP32 pool: [m_all | v_all]
+    float* fp32_m = opt->fp32_pool;
+    float* fp32_v = fp32_m + total_fp32_params;
+
+    auto assign_fp32 = [&](Qwen3AdamW::FP32ParamState& ps, long sz) {
+        ps.m = fp32_m;  fp32_m += sz;
+        ps.v = fp32_v;  fp32_v += sz;
+    };
+
+    for (int l = 0; l < L; l++) {
+        assign_fp32(opt->input_norm[l],     H);
+        assign_fp32(opt->q_norm[l],         c.head_dim);
+        assign_fp32(opt->k_norm[l],         c.head_dim);
+        assign_fp32(opt->post_attn_norm[l], H);
+    }
+    assign_fp32(opt->final_norm, final_norm_sz);
+
+    // Initialize master weights from model FP16 weights
+    for (int l = 0; l < L; l++) {
+        const auto& lw = w.layers[l];
+        fp16_to_fp32(opt->q_proj[l].master_w,    lw.q_proj,    q_proj_sz,    0);
+        fp16_to_fp32(opt->k_proj[l].master_w,    lw.k_proj,    k_proj_sz,    0);
+        fp16_to_fp32(opt->v_proj[l].master_w,    lw.v_proj,    v_proj_sz,    0);
+        fp16_to_fp32(opt->o_proj[l].master_w,    lw.o_proj,    o_proj_sz,    0);
+        fp16_to_fp32(opt->gate_proj[l].master_w, lw.gate_proj, gate_proj_sz, 0);
+        fp16_to_fp32(opt->up_proj[l].master_w,   lw.up_proj,   up_proj_sz,   0);
+        fp16_to_fp32(opt->down_proj[l].master_w, lw.down_proj, down_proj_sz, 0);
+    }
+    fp16_to_fp32(opt->embed.master_w, w.embed_tokens, embed_sz, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    printf("[AdamW] Allocated: fp16_state=%.1f MB  fp32_state=%.2f MB  (lr=%.1e wd=%.2f)\n",
+           opt->fp16_pool_bytes / (1024.0 * 1024.0),
+           opt->fp32_pool_bytes / (1024.0 * 1024.0),
+           config.lr, config.weight_decay);
+
+    return opt;
+}
+
+void qwen3_adamw_free(Qwen3AdamW* opt) {
+    if (!opt) return;
+    cudaFree(opt->fp16_pool);
+    cudaFree(opt->fp32_pool);
+    delete[] opt->q_proj;
+    delete[] opt->k_proj;
+    delete[] opt->v_proj;
+    delete[] opt->o_proj;
+    delete[] opt->gate_proj;
+    delete[] opt->up_proj;
+    delete[] opt->down_proj;
+    delete[] opt->input_norm;
+    delete[] opt->q_norm;
+    delete[] opt->k_norm;
+    delete[] opt->post_attn_norm;
+    delete opt;
+}
+
+void qwen3_adamw_step(
+    Qwen3Model* model,
+    Qwen3Gradients* grads,
+    Qwen3AdamW* opt,
+    cudaStream_t stream
+) {
+    opt->step++;
+    const Qwen3Config& c = model->config;
+    const int L = c.num_hidden_layers;
+    const int H = c.hidden_size;
+    const auto& cfg = opt->config;
+
+    float bc1 = 1.0f - powf(cfg.beta1, (float)opt->step);
+    float bc2 = 1.0f - powf(cfg.beta2, (float)opt->step);
+
+    // FP16 param sizes
+    const int q_proj_sz    = c.q_dim * H;
+    const int k_proj_sz    = c.kv_dim * H;
+    const int v_proj_sz    = c.kv_dim * H;
+    const int o_proj_sz    = H * c.q_dim;
+    const int gate_proj_sz = c.intermediate_size * H;
+    const int up_proj_sz   = c.intermediate_size * H;
+    const int down_proj_sz = H * c.intermediate_size;
+    const int embed_sz     = c.vocab_size * H;
+
+    // Update all per-layer FP16 weights
+    for (int l = 0; l < L; l++) {
+        auto& lw = model->weights.layers[l];
+
+        launch_adamw_fp16(opt->q_proj[l].master_w, lw.q_proj, grads->dW_q_proj[l],
+                          opt->q_proj[l].m, opt->q_proj[l].v, q_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->k_proj[l].master_w, lw.k_proj, grads->dW_k_proj[l],
+                          opt->k_proj[l].m, opt->k_proj[l].v, k_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->v_proj[l].master_w, lw.v_proj, grads->dW_v_proj[l],
+                          opt->v_proj[l].m, opt->v_proj[l].v, v_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->o_proj[l].master_w, lw.o_proj, grads->dW_o_proj[l],
+                          opt->o_proj[l].m, opt->o_proj[l].v, o_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->gate_proj[l].master_w, lw.gate_proj, grads->dW_gate_proj[l],
+                          opt->gate_proj[l].m, opt->gate_proj[l].v, gate_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->up_proj[l].master_w, lw.up_proj, grads->dW_up_proj[l],
+                          opt->up_proj[l].m, opt->up_proj[l].v, up_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp16(opt->down_proj[l].master_w, lw.down_proj, grads->dW_down_proj[l],
+                          opt->down_proj[l].m, opt->down_proj[l].v, down_proj_sz,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                          bc1, bc2, stream);
+    }
+
+    // Embedding (tied = lm_head)
+    launch_adamw_fp16(opt->embed.master_w, model->weights.embed_tokens, grads->dW_embed,
+                      opt->embed.m, opt->embed.v, embed_sz,
+                      cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                      bc1, bc2, stream);
+
+    // Update all per-layer FP32 weights (norms — typically no weight decay)
+    float norm_wd = 0.0f;  // standard practice: no weight decay on norm params
+
+    for (int l = 0; l < L; l++) {
+        auto& lw = model->weights.layers[l];
+
+        launch_adamw_fp32(lw.input_layernorm, grads->dW_input_norm[l],
+                          opt->input_norm[l].m, opt->input_norm[l].v, H,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, norm_wd,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp32(lw.q_norm, grads->dW_q_norm[l],
+                          opt->q_norm[l].m, opt->q_norm[l].v, c.head_dim,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, norm_wd,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp32(lw.k_norm, grads->dW_k_norm[l],
+                          opt->k_norm[l].m, opt->k_norm[l].v, c.head_dim,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, norm_wd,
+                          bc1, bc2, stream);
+
+        launch_adamw_fp32(lw.post_attn_layernorm, grads->dW_post_attn_norm[l],
+                          opt->post_attn_norm[l].m, opt->post_attn_norm[l].v, H,
+                          cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, norm_wd,
+                          bc1, bc2, stream);
+    }
+
+    // Final norm
+    launch_adamw_fp32(model->weights.final_norm, grads->dW_final_norm,
+                      opt->final_norm.m, opt->final_norm.v, H,
+                      cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, norm_wd,
+                      bc1, bc2, stream);
 }

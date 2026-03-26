@@ -16,3 +16,17 @@ void launch_swiglu(
     int          n_elements,
     cudaStream_t stream = 0
 );
+
+// Backward pass for SwiGLU: out = silu(gate) * up
+//   dGate_i = dOut_i * up_i * σ(g_i) * (1 + g_i * (1 - σ(g_i)))
+//   dUp_i   = dOut_i * silu(g_i)
+// where σ = sigmoid, silu(g) = g * σ(g)
+void launch_swiglu_backward(
+    half*        dGate,      // [n_elements] gradient for gate input
+    half*        dUp,        // [n_elements] gradient for up input
+    const half*  dOut,       // [n_elements] upstream gradient
+    const half*  gate,       // [n_elements] saved gate from forward
+    const half*  up,         // [n_elements] saved up from forward
+    int          n_elements,
+    cudaStream_t stream = 0
+);
