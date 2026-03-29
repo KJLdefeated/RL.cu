@@ -116,82 +116,91 @@ static size_t dtype_size(const std::string& dtype) {
 }
 
 // ============================================================================
-// GPU allocation + upload helpers
+// Conversion helpers (BF16 → FP16/FP32, write into caller-provided buffer)
 // ============================================================================
 
-static half* alloc_and_upload(const void* src, size_t bytes, size_t* total) {
-    half* dst = nullptr;
-    CUDA_CHECK(cudaMalloc(&dst, bytes));
-    CUDA_CHECK(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice));
-    *total += bytes;
-    return dst;
-}
-
-// Upload with BF16->FP16 conversion on CPU (for large weight tensors)
-static half* alloc_upload_bf16_to_fp16(const void* src_bf16, size_t num_elements, size_t* total) {
-    std::vector<half> fp16_buf(num_elements);
+static void bf16_to_fp16(half* dst, const void* src_bf16, size_t n) {
     const uint16_t* src = (const uint16_t*)src_bf16;
-    for (size_t i = 0; i < num_elements; i++) {
+    for (size_t i = 0; i < n; i++) {
         uint32_t fp32_bits = ((uint32_t)src[i]) << 16;
         float f;
         memcpy(&f, &fp32_bits, sizeof(float));
-        fp16_buf[i] = __float2half(f);
+        dst[i] = __float2half(f);
     }
-    size_t bytes = num_elements * sizeof(half);
-    half* dst = nullptr;
-    CUDA_CHECK(cudaMalloc(&dst, bytes));
-    CUDA_CHECK(cudaMemcpy(dst, fp16_buf.data(), bytes, cudaMemcpyHostToDevice));
-    *total += bytes;
-    return dst;
 }
 
-// Upload with BF16->FP32 conversion (for norm weights — avoids FP16 range loss)
-static float* alloc_upload_bf16_to_fp32(const void* src_bf16, size_t num_elements, size_t* total) {
-    std::vector<float> fp32_buf(num_elements);
+static void bf16_to_fp32(float* dst, const void* src_bf16, size_t n) {
     const uint16_t* src = (const uint16_t*)src_bf16;
-    for (size_t i = 0; i < num_elements; i++) {
+    for (size_t i = 0; i < n; i++) {
         uint32_t fp32_bits = ((uint32_t)src[i]) << 16;
-        memcpy(&fp32_buf[i], &fp32_bits, sizeof(float));
+        memcpy(&dst[i], &fp32_bits, sizeof(float));
     }
-    size_t bytes = num_elements * sizeof(float);
-    float* dst = nullptr;
-    CUDA_CHECK(cudaMalloc(&dst, bytes));
-    CUDA_CHECK(cudaMemcpy(dst, fp32_buf.data(), bytes, cudaMemcpyHostToDevice));
-    *total += bytes;
-    return dst;
+}
+
+static void fp16_to_fp32_cpu(float* dst, const void* src_fp16, size_t n) {
+    const uint16_t* src = (const uint16_t*)src_fp16;
+    for (size_t i = 0; i < n; i++) dst[i] = __half2float(*(const half*)&src[i]);
 }
 
 // ============================================================================
-// Main loader
+// Main loader — flat buffer pattern
+//
+// Two bulk GPU allocations:
+//   fp16_pool: all FP16 weight tensors (projections + embedding)
+//   fp32_pool: all FP32 weight tensors (norms)
+//
+// Layout matches Qwen3Gradients pool layout for flat optimizer step:
+//   FP16: per-layer [q, k, v, o, gate, up, down], then embed
+//   FP32: per-layer [input_norm, q_norm, k_norm, post_attn_norm], then final_norm
 // ============================================================================
 
 Qwen3Weights load_weights(const std::string& model_dir, const Qwen3Config& cfg) {
     Qwen3Weights w;
-    w.layers.resize(cfg.num_hidden_layers);
+    const int L = cfg.num_hidden_layers;
+    const int H = cfg.hidden_size;
+    w.layers.resize(L);
 
-    // Find safetensors files
-    // Qwen3-0.6B has a single model.safetensors
-    // Larger models have model-00001-of-NNNNN.safetensors + model.safetensors.index.json
+    // --- Compute flat pool sizes ---
+    const size_t q_proj_sz    = (size_t)cfg.q_dim * H;
+    const size_t k_proj_sz    = (size_t)cfg.kv_dim * H;
+    const size_t v_proj_sz    = (size_t)cfg.kv_dim * H;
+    const size_t o_proj_sz    = (size_t)H * cfg.q_dim;
+    const size_t gate_proj_sz = (size_t)cfg.intermediate_size * H;
+    const size_t up_proj_sz   = (size_t)cfg.intermediate_size * H;
+    const size_t down_proj_sz = (size_t)H * cfg.intermediate_size;
+    const size_t per_layer_fp16 = q_proj_sz + k_proj_sz + v_proj_sz + o_proj_sz
+                                 + gate_proj_sz + up_proj_sz + down_proj_sz;
+    const size_t embed_sz = (size_t)cfg.vocab_size * H;
+    const size_t total_fp16 = per_layer_fp16 * L + embed_sz;
+
+    const size_t per_layer_fp32 = (size_t)H + cfg.head_dim + cfg.head_dim + H;
+    const size_t final_norm_sz = H;
+    const size_t total_fp32 = per_layer_fp32 * L + final_norm_sz;
+
+    w.fp16_pool_elems = total_fp16;
+    w.fp32_pool_elems = total_fp32;
+
+    // --- Allocate host staging buffers ---
+    std::vector<half>  h_fp16(total_fp16);
+    std::vector<float> h_fp32(total_fp32);
+
+    // --- Open safetensors files ---
     std::vector<SafetensorsFile> files;
-    std::unordered_map<std::string, size_t> tensor_to_file;  // tensor_name -> file index
+    std::unordered_map<std::string, size_t> tensor_to_file;
 
     std::string single = model_dir + "/model.safetensors";
     std::string index_path = model_dir + "/model.safetensors.index.json";
 
     if (std::filesystem::exists(single) && !std::filesystem::exists(index_path)) {
-        // Single file (e.g., Qwen3-0.6B)
         files.push_back(open_safetensors(single));
         for (auto& [key, val] : files[0].header.items()) {
             if (key == "__metadata__") continue;
             tensor_to_file[key] = 0;
         }
     } else if (std::filesystem::exists(index_path)) {
-        // Sharded model: read index to find which file has which tensor
         std::ifstream idx_f(index_path);
         json idx = json::parse(idx_f);
         auto& weight_map = idx["weight_map"];
-
-        // Collect unique filenames
         std::unordered_map<std::string, size_t> file_indices;
         for (auto& [tensor_name, filename] : weight_map.items()) {
             std::string fname = filename.get<std::string>();
@@ -209,10 +218,9 @@ Qwen3Weights load_weights(const std::string& model_dir, const Qwen3Config& cfg) 
 
     printf("[WEIGHTS] Loading from %zu safetensors file(s)...\n", files.size());
 
-    // Helper: find and upload a tensor by name
     bool is_bf16 = (cfg.torch_dtype == "bfloat16");
 
-    // Helper: look up a tensor's data pointer + element count
+    // Helper: find tensor data in safetensors
     auto find_tensor = [&](const std::string& name, size_t expected_elements,
                            const void** out_data, size_t* out_num_elements,
                            std::string* out_dtype) -> bool {
@@ -238,113 +246,111 @@ Qwen3Weights load_weights(const std::string& model_dir, const Qwen3Config& cfg) 
         return true;
     };
 
-    // Upload as FP16 (BF16->FP16 conversion if needed)
-    auto upload_tensor = [&](const std::string& name, size_t expected_elements) -> half* {
+    // Convert and write tensor into FP16 staging buffer at given offset
+    auto stage_fp16 = [&](const std::string& name, size_t expected, half* dst) {
         const void* data; size_t n; std::string dtype;
-        if (!find_tensor(name, expected_elements, &data, &n, &dtype)) return nullptr;
-        if (is_bf16 && dtype == "BF16")
-            return alloc_upload_bf16_to_fp16(data, n, &w.total_bytes);
-        return alloc_and_upload(data, n * dtype_size(dtype), &w.total_bytes);
-    };
-
-    // Upload as FP32 (BF16->FP32; avoids FP16 range/precision loss for norm weights)
-    auto upload_tensor_fp32 = [&](const std::string& name, size_t expected_elements) -> float* {
-        const void* data; size_t n; std::string dtype;
-        if (!find_tensor(name, expected_elements, &data, &n, &dtype)) return nullptr;
-        if (is_bf16 && dtype == "BF16")
-            return alloc_upload_bf16_to_fp32(data, n, &w.total_bytes);
-        // Already FP32 — direct upload
-        if (dtype == "F32") {
-            float* dst = nullptr;
-            size_t bytes = n * sizeof(float);
-            CUDA_CHECK(cudaMalloc(&dst, bytes));
-            CUDA_CHECK(cudaMemcpy(dst, data, bytes, cudaMemcpyHostToDevice));
-            w.total_bytes += bytes;
-            return dst;
+        if (!find_tensor(name, expected, &data, &n, &dtype)) return;
+        if (is_bf16 && dtype == "BF16") {
+            bf16_to_fp16(dst, data, n);
+        } else if (dtype == "F16") {
+            memcpy(dst, data, n * sizeof(half));
+        } else {
+            fprintf(stderr, "WARNING: unexpected dtype '%s' for FP16 tensor '%s'\n",
+                    dtype.c_str(), name.c_str());
         }
-        // FP16 -> FP32 fallback
-        std::vector<float> buf(n);
-        const uint16_t* src = (const uint16_t*)data;
-        for (size_t i = 0; i < n; i++) buf[i] = __half2float(*(const half*)&src[i]);
-        float* dst = nullptr;
-        CUDA_CHECK(cudaMalloc(&dst, n * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(dst, buf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-        w.total_bytes += n * sizeof(float);
-        return dst;
     };
 
-    // --- Upload global tensors ---
-    size_t embed_elems = (size_t)cfg.vocab_size * cfg.hidden_size;
-    w.embed_tokens = upload_tensor("model.embed_tokens.weight", embed_elems);
-    if (cfg.tie_word_embeddings) {
-        // Weights are identical by construction — share the GPU pointer, save ~311 MB.
-        w.lm_head = w.embed_tokens;
-    } else {
-        w.lm_head = upload_tensor("lm_head.weight", embed_elems);
-    }
-    w.final_norm   = upload_tensor_fp32("model.norm.weight", cfg.hidden_size);
+    // Convert and write tensor into FP32 staging buffer at given offset
+    auto stage_fp32 = [&](const std::string& name, size_t expected, float* dst) {
+        const void* data; size_t n; std::string dtype;
+        if (!find_tensor(name, expected, &data, &n, &dtype)) return;
+        if (is_bf16 && dtype == "BF16") {
+            bf16_to_fp32(dst, data, n);
+        } else if (dtype == "F32") {
+            memcpy(dst, data, n * sizeof(float));
+        } else if (dtype == "F16") {
+            fp16_to_fp32_cpu(dst, data, n);
+        }
+    };
 
-    // --- Upload per-layer tensors ---
-    for (int i = 0; i < cfg.num_hidden_layers; i++) {
-        auto& L = w.layers[i];
+    // --- Stage FP16 tensors into host buffer ---
+    // Layout: per-layer [q, k, v, o, gate, up, down], then embed
+    half* hp = h_fp16.data();
+    for (int i = 0; i < L; i++) {
         std::string prefix = "model.layers." + std::to_string(i);
-
-        L.input_layernorm     = upload_tensor_fp32(prefix + ".input_layernorm.weight",
-                                                   cfg.hidden_size);
-        L.q_proj              = upload_tensor(prefix + ".self_attn.q_proj.weight",
-                                              (size_t)cfg.q_dim * cfg.hidden_size);
-        L.k_proj              = upload_tensor(prefix + ".self_attn.k_proj.weight",
-                                              (size_t)cfg.kv_dim * cfg.hidden_size);
-        L.v_proj              = upload_tensor(prefix + ".self_attn.v_proj.weight",
-                                              (size_t)cfg.kv_dim * cfg.hidden_size);
-        L.o_proj              = upload_tensor(prefix + ".self_attn.o_proj.weight",
-                                              (size_t)cfg.hidden_size * cfg.q_dim);
-        L.q_norm              = upload_tensor_fp32(prefix + ".self_attn.q_norm.weight",
-                                                   cfg.head_dim);
-        L.k_norm              = upload_tensor_fp32(prefix + ".self_attn.k_norm.weight",
-                                                   cfg.head_dim);
-        L.post_attn_layernorm = upload_tensor_fp32(prefix + ".post_attention_layernorm.weight",
-                                                   cfg.hidden_size);
-        L.gate_proj           = upload_tensor(prefix + ".mlp.gate_proj.weight",
-                                              (size_t)cfg.intermediate_size * cfg.hidden_size);
-        L.up_proj             = upload_tensor(prefix + ".mlp.up_proj.weight",
-                                              (size_t)cfg.intermediate_size * cfg.hidden_size);
-        L.down_proj           = upload_tensor(prefix + ".mlp.down_proj.weight",
-                                              (size_t)cfg.hidden_size * cfg.intermediate_size);
+        stage_fp16(prefix + ".self_attn.q_proj.weight",    q_proj_sz,    hp); hp += q_proj_sz;
+        stage_fp16(prefix + ".self_attn.k_proj.weight",    k_proj_sz,    hp); hp += k_proj_sz;
+        stage_fp16(prefix + ".self_attn.v_proj.weight",    v_proj_sz,    hp); hp += v_proj_sz;
+        stage_fp16(prefix + ".self_attn.o_proj.weight",    o_proj_sz,    hp); hp += o_proj_sz;
+        stage_fp16(prefix + ".mlp.gate_proj.weight",       gate_proj_sz, hp); hp += gate_proj_sz;
+        stage_fp16(prefix + ".mlp.up_proj.weight",         up_proj_sz,   hp); hp += up_proj_sz;
+        stage_fp16(prefix + ".mlp.down_proj.weight",       down_proj_sz, hp); hp += down_proj_sz;
     }
+    stage_fp16("model.embed_tokens.weight", embed_sz, hp);
 
-    printf("[WEIGHTS] Loaded %.2f MB to GPU (%d layers)\n",
-           w.total_bytes / (1024.0 * 1024.0), cfg.num_hidden_layers);
+    // --- Stage FP32 tensors into host buffer ---
+    // Layout: per-layer [input_norm, q_norm, k_norm, post_attn_norm], then final_norm
+    float* fp = h_fp32.data();
+    for (int i = 0; i < L; i++) {
+        std::string prefix = "model.layers." + std::to_string(i);
+        stage_fp32(prefix + ".input_layernorm.weight",          H,           fp); fp += H;
+        stage_fp32(prefix + ".self_attn.q_norm.weight",         cfg.head_dim, fp); fp += cfg.head_dim;
+        stage_fp32(prefix + ".self_attn.k_norm.weight",         cfg.head_dim, fp); fp += cfg.head_dim;
+        stage_fp32(prefix + ".post_attention_layernorm.weight",  H,           fp); fp += H;
+    }
+    stage_fp32("model.norm.weight", final_norm_sz, fp);
+
+    // --- One cudaMalloc + cudaMemcpy per pool ---
+    size_t fp16_bytes = total_fp16 * sizeof(half);
+    size_t fp32_bytes = total_fp32 * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&w.fp16_pool, fp16_bytes));
+    CUDA_CHECK(cudaMalloc(&w.fp32_pool, fp32_bytes));
+    CUDA_CHECK(cudaMemcpy(w.fp16_pool, h_fp16.data(), fp16_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(w.fp32_pool, h_fp32.data(), fp32_bytes, cudaMemcpyHostToDevice));
+
+    w.total_bytes = fp16_bytes + fp32_bytes;
+
+    // --- Assign convenience pointers (offsets into pools) ---
+    half* hp2 = w.fp16_pool;
+    for (int i = 0; i < L; i++) {
+        auto& lw = w.layers[i];
+        lw.q_proj    = hp2; hp2 += q_proj_sz;
+        lw.k_proj    = hp2; hp2 += k_proj_sz;
+        lw.v_proj    = hp2; hp2 += v_proj_sz;
+        lw.o_proj    = hp2; hp2 += o_proj_sz;
+        lw.gate_proj = hp2; hp2 += gate_proj_sz;
+        lw.up_proj   = hp2; hp2 += up_proj_sz;
+        lw.down_proj = hp2; hp2 += down_proj_sz;
+    }
+    w.embed_tokens = hp2;
+    w.lm_head = cfg.tie_word_embeddings ? w.embed_tokens : (hp2 + embed_sz);  // tied
+
+    float* fp2 = w.fp32_pool;
+    for (int i = 0; i < L; i++) {
+        auto& lw = w.layers[i];
+        lw.input_layernorm     = fp2; fp2 += H;
+        lw.q_norm              = fp2; fp2 += cfg.head_dim;
+        lw.k_norm              = fp2; fp2 += cfg.head_dim;
+        lw.post_attn_layernorm = fp2; fp2 += H;
+    }
+    w.final_norm = fp2;
+
+    printf("[WEIGHTS] Loaded %.2f MB to GPU (%d layers, flat: fp16=%zu fp32=%zu params)\n",
+           w.total_bytes / (1024.0 * 1024.0), L, total_fp16, total_fp32);
 
     return w;
 }
 
 void free_weights(Qwen3Weights& w) {
-    // Generic: works for both half* and float*
-    auto safe_free = [](auto*& p) {
-        if (p) { cudaFree(p); p = nullptr; }
-    };
-
-    safe_free(w.embed_tokens);
-    // lm_head is either an alias of embed_tokens (tied) or an independent allocation.
-    // Only free it when it's independent; the embed_tokens free above handles the tied case.
-    if (w.lm_head != nullptr && w.lm_head != w.embed_tokens)
-        safe_free(w.lm_head);
-    safe_free(w.final_norm);
-
-    for (auto& L : w.layers) {
-        safe_free(L.input_layernorm);
-        safe_free(L.q_proj);
-        safe_free(L.k_proj);
-        safe_free(L.v_proj);
-        safe_free(L.o_proj);
-        safe_free(L.q_norm);
-        safe_free(L.k_norm);
-        safe_free(L.post_attn_layernorm);
-        safe_free(L.gate_proj);
-        safe_free(L.up_proj);
-        safe_free(L.down_proj);
-    }
+    if (w.fp16_pool) { cudaFree(w.fp16_pool); w.fp16_pool = nullptr; }
+    if (w.fp32_pool) { cudaFree(w.fp32_pool); w.fp32_pool = nullptr; }
+    // All layer/embed/norm pointers were offsets into pools — nothing else to free.
+    w.embed_tokens = nullptr;
+    w.lm_head      = nullptr;
+    w.final_norm   = nullptr;
     w.layers.clear();
     w.total_bytes = 0;
+    w.fp16_pool_elems = 0;
+    w.fp32_pool_elems = 0;
 }

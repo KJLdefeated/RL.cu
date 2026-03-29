@@ -46,26 +46,28 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [x] Model runner (allocate correct KV cache size, batch forward)
 - [x] Scheduler (schedule input request)
 - [x] LLM Engine
-- [ ] Benchmark with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
+- [ ] Align with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
 
-### SFT Full Finetuning
-- [ ] Dataset loading (maybe need apache arrow)
-- [ ] Implement backward kernels for every forward op:
-  - Attention backward (FA2 backward already done in Phase 0)
+### Training
+- [x] Dataset loading
+- [x] Implement backward kernels for every forward op:
+  - Attention backward
   - RMSNorm backward
   - SwiGLU backward
-  - Linear layer backward (matmul transposed)
+  - Linear layer backward
   - Embedding backward
   - RoPE backward
-- [ ] Implement gradient accumulation across micro-batches
-- [ ] Validate: match PyTorch autograd gradients to <1e-3
-- [ ] Implement AdamW optimizer in CUDA:
-  - FP32 optimizer states (m, v) with BF16 model weights
+- [x] Implement AdamW optimizer in CUDA:
+  - FP32 optimizer states (m, v) with FP16 model weights
   - Weight decay, bias correction
   - Fused kernel: update + decay in single pass
-- [ ] Implement learning rate scheduler (cosine with warmup)
-- [ ] Build basic SFT training loop: load data → forward → loss → backward → step
-- [ ] Validate on tiny dataset: loss should decrease matching PyTorch
+  - Flat buffer pattern for contiguous memory access
+- [x] Implement learning rate scheduler (cosine with warmup)
+- [ ] Trainer
+  - [ ] Implement gradient accumulation across micro-batches
+  - [ ] Logging and training curve
+  - [ ] Build basic SFT training loop: load data → forward → loss → backward → step
+  - [ ] Validate on tiny dataset: loss should decrease matching PyTorch
 - [ ] Successful SFT fine-tuning matching PyTorch training curves
 
 ### GRPO Core Algorithm

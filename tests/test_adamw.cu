@@ -1,6 +1,6 @@
 // test_adamw.cu
 //
-// Tests the fused AdamW optimizer (qwen3_adamw_step).
+// Tests the fused AdamW optimizer (AdamWOptimizer class).
 //
 // Validates:
 //   1. CPU reference match for AdamW formula (FP32 norm weights)
@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include "model/qwen3.h"
+#include "training/optimizer.h"
 
 static const char* MODEL_DIR = "model_weights/Qwen3-0.6B";
 
@@ -57,7 +58,7 @@ static double compute_nll(Qwen3Model* m, Qwen3TrainState* state,
 
 // Helper: one forward + backward + optimizer step
 static void train_step(Qwen3Model* m, Qwen3TrainState* state,
-                       Qwen3Gradients* grads, Qwen3AdamW* opt,
+                       Qwen3Gradients* grads, AdamWOptimizer* opt,
                        const int* tokens, const int* targets,
                        float* d_log_probs, float* d_upstream,
                        int B, int S) {
@@ -66,7 +67,7 @@ static void train_step(Qwen3Model* m, Qwen3TrainState* state,
     qwen3_gradients_zero(grads);
     qwen3_backward(m, state, grads, d_upstream);
     CUDA_CHECK(cudaDeviceSynchronize());
-    qwen3_adamw_step(m, grads, opt);
+    opt->step(grads);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -169,9 +170,7 @@ static void test_cpu_reference_fp32(Qwen3Model* m) {
     auto snap = save_weights(m);
     auto* state = qwen3_train_state_alloc(c, B, S);
     auto* grads = qwen3_gradients_alloc(c, T);
-    AdamWConfig acfg;
-    acfg.lr = 1e-3f;
-    auto* opt = qwen3_adamw_alloc(c, m->weights, acfg);
+    auto* opt = new AdamWOptimizer(m, /*lr=*/1e-3f);
 
     float* d_log_probs;
     CUDA_CHECK(cudaMalloc(&d_log_probs, T * sizeof(float)));
@@ -193,20 +192,21 @@ static void test_cpu_reference_fp32(Qwen3Model* m) {
                           c.hidden_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     // CPU reference: step 1 of AdamW (no weight decay on norms)
-    float bc1 = 1.0f - acfg.beta1;
-    float bc2 = 1.0f - acfg.beta2;
+    float _beta1 = opt->beta1, _beta2 = opt->beta2, _lr = opt->lr, _eps = opt->eps;
+    float bc1 = 1.0f - _beta1;
+    float bc2 = 1.0f - _beta2;
     std::vector<float> cpu_w(c.hidden_size);
     for (int i = 0; i < c.hidden_size; i++) {
         float g = grad[i];
-        float mi = (1.0f - acfg.beta1) * g;
-        float vi = (1.0f - acfg.beta2) * g * g;
+        float mi = (1.0f - _beta1) * g;
+        float vi = (1.0f - _beta2) * g * g;
         float m_hat = mi / bc1;
         float v_hat = vi / bc2;
-        cpu_w[i] = snap.final_norm[i] - acfg.lr * m_hat / (sqrtf(v_hat) + acfg.eps);
+        cpu_w[i] = snap.final_norm[i] - _lr * m_hat / (sqrtf(v_hat) + _eps);
     }
 
     // GPU step
-    qwen3_adamw_step(m, grads, opt);
+    opt->step(grads);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> gpu_w(c.hidden_size);
@@ -228,7 +228,7 @@ static void test_cpu_reference_fp32(Qwen3Model* m) {
     cudaFree(d_upstream);
     qwen3_train_state_free(state);
     qwen3_gradients_free(grads);
-    qwen3_adamw_free(opt);
+    delete opt;
 }
 
 // =============================================================================
@@ -248,10 +248,8 @@ static void test_cpu_reference_fp16(Qwen3Model* m) {
     auto snap = save_weights(m);
     auto* state = qwen3_train_state_alloc(c, B, S);
     auto* grads = qwen3_gradients_alloc(c, T);
-    AdamWConfig acfg;
-    acfg.lr = 1e-3f;
-    acfg.weight_decay = 0.01f;
-    auto* opt = qwen3_adamw_alloc(c, m->weights, acfg);
+    auto* opt = new AdamWOptimizer(m, /*lr=*/1e-3f, /*beta1=*/0.9f, /*beta2=*/0.999f,
+                                   /*eps=*/1e-8f, /*weight_decay=*/0.01f);
 
     float* d_log_probs;
     CUDA_CHECK(cudaMalloc(&d_log_probs, T * sizeof(float)));
@@ -276,24 +274,26 @@ static void test_cpu_reference_fp16(Qwen3Model* m) {
     for (int i = 0; i < qsz; i++) w0[i] = __half2float(snap.layers[0].q[i]);
 
     // CPU reference
-    float bc1 = 1.0f - acfg.beta1;
-    float bc2 = 1.0f - acfg.beta2;
+    float _beta1 = opt->beta1, _beta2 = opt->beta2, _lr = opt->lr;
+    float _eps = opt->eps, _wd = opt->weight_decay;
+    float bc1 = 1.0f - _beta1;
+    float bc2 = 1.0f - _beta2;
     std::vector<float> cpu_master(qsz);
     std::vector<half> cpu_fp16(qsz);
     for (int i = 0; i < qsz; i++) {
         float g = __half2float(grad_h[i]);
-        float mi = (1.0f - acfg.beta1) * g;
-        float vi = (1.0f - acfg.beta2) * g * g;
+        float mi = (1.0f - _beta1) * g;
+        float vi = (1.0f - _beta2) * g * g;
         float m_hat = mi / bc1;
         float v_hat = vi / bc2;
-        float w = w0[i] * (1.0f - acfg.lr * acfg.weight_decay)
-                  - acfg.lr * m_hat / (sqrtf(v_hat) + acfg.eps);
+        float w = w0[i] * (1.0f - _lr * _wd)
+                  - _lr * m_hat / (sqrtf(v_hat) + _eps);
         cpu_master[i] = w;
         cpu_fp16[i] = __float2half(w);
     }
 
     // GPU step
-    qwen3_adamw_step(m, grads, opt);
+    opt->step(grads);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Read GPU FP16 result
@@ -303,7 +303,7 @@ static void test_cpu_reference_fp16(Qwen3Model* m) {
 
     // Read GPU master copy
     std::vector<float> gpu_master(qsz);
-    CUDA_CHECK(cudaMemcpy(gpu_master.data(), opt->q_proj[0].master_w,
+    CUDA_CHECK(cudaMemcpy(gpu_master.data(), opt->get_fp16_master(0, 0),
                           qsz * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Check master (FP32 exact match)
@@ -328,7 +328,7 @@ static void test_cpu_reference_fp16(Qwen3Model* m) {
     cudaFree(d_upstream);
     qwen3_train_state_free(state);
     qwen3_gradients_free(grads);
-    qwen3_adamw_free(opt);
+    delete opt;
 }
 
 // =============================================================================
@@ -347,8 +347,7 @@ static void test_moments_nonzero(Qwen3Model* m) {
     auto snap = save_weights(m);
     auto* state = qwen3_train_state_alloc(c, B, S);
     auto* grads = qwen3_gradients_alloc(c, T);
-    AdamWConfig acfg;
-    auto* opt = qwen3_adamw_alloc(c, m->weights, acfg);
+    auto* opt = new AdamWOptimizer(m);
 
     float* d_log_probs;
     CUDA_CHECK(cudaMalloc(&d_log_probs, T * sizeof(float)));
@@ -362,8 +361,8 @@ static void test_moments_nonzero(Qwen3Model* m) {
 
     // Check final_norm moments (FP32 path)
     std::vector<float> m_buf(c.hidden_size), v_buf(c.hidden_size);
-    CUDA_CHECK(cudaMemcpy(m_buf.data(), opt->final_norm.m, c.hidden_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(v_buf.data(), opt->final_norm.v, c.hidden_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(m_buf.data(), opt->get_final_norm_m(), c.hidden_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(v_buf.data(), opt->get_final_norm_v(), c.hidden_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     float m_sum = 0, v_sum = 0;
     bool finite = true;
@@ -374,10 +373,10 @@ static void test_moments_nonzero(Qwen3Model* m) {
     }
 
     // Check q_proj[0] moments (FP16 path)
-    int check_n = 1024;  // spot-check
+    int check_n = 1024;
     std::vector<float> qm(check_n), qv(check_n);
-    CUDA_CHECK(cudaMemcpy(qm.data(), opt->q_proj[0].m, check_n * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(qv.data(), opt->q_proj[0].v, check_n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(qm.data(), opt->get_fp16_m(0, 0), check_n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(qv.data(), opt->get_fp16_v(0, 0), check_n * sizeof(float), cudaMemcpyDeviceToHost));
 
     float qm_sum = 0, qv_sum = 0;
     for (int i = 0; i < check_n; i++) {
@@ -402,7 +401,7 @@ static void test_moments_nonzero(Qwen3Model* m) {
     cudaFree(d_upstream);
     qwen3_train_state_free(state);
     qwen3_gradients_free(grads);
-    qwen3_adamw_free(opt);
+    delete opt;
 }
 
 // =============================================================================
@@ -419,8 +418,7 @@ static void test_step_counter(Qwen3Model* m) {
     auto snap = save_weights(m);
     auto* state = qwen3_train_state_alloc(c, B, S);
     auto* grads = qwen3_gradients_alloc(c, T);
-    AdamWConfig acfg;
-    auto* opt = qwen3_adamw_alloc(c, m->weights, acfg);
+    auto* opt = new AdamWOptimizer(m);
 
     float* d_log_probs;
     CUDA_CHECK(cudaMalloc(&d_log_probs, T * sizeof(float)));
@@ -429,24 +427,24 @@ static void test_step_counter(Qwen3Model* m) {
     std::vector<float> ones(T, 1.0f);
     CUDA_CHECK(cudaMemcpy(d_upstream, ones.data(), T * sizeof(float), cudaMemcpyHostToDevice));
 
-    bool ok = (opt->step == 0);
+    bool ok = (opt->get_step() == 0);
 
     for (int i = 0; i < 3; i++)
         train_step(m, state, grads, opt, tokens.data(), targets.data(),
                    d_log_probs, d_upstream, B, S);
 
-    ok = ok && (opt->step == 3);
+    ok = ok && (opt->get_step() == 3);
 
     restore_weights(m, snap);
 
     if (ok) { PASS(name); }
-    else { FAIL(name, "step=%d, expected 3", opt->step); }
+    else { FAIL(name, "step=%d, expected 3", opt->get_step()); }
 
     cudaFree(d_log_probs);
     cudaFree(d_upstream);
     qwen3_train_state_free(state);
     qwen3_gradients_free(grads);
-    qwen3_adamw_free(opt);
+    delete opt;
 }
 
 // =============================================================================
@@ -465,9 +463,7 @@ static void test_multi_step(Qwen3Model* m) {
     auto snap = save_weights(m);
     auto* state = qwen3_train_state_alloc(c, B, S);
     auto* grads = qwen3_gradients_alloc(c, T);
-    AdamWConfig acfg;
-    acfg.lr = 1e-4f;
-    auto* opt = qwen3_adamw_alloc(c, m->weights, acfg);
+    auto* opt = new AdamWOptimizer(m, /*lr=*/1e-4f);
 
     float* d_log_probs;
     CUDA_CHECK(cudaMalloc(&d_log_probs, T * sizeof(float)));
@@ -501,7 +497,7 @@ static void test_multi_step(Qwen3Model* m) {
     cudaFree(d_upstream);
     qwen3_train_state_free(state);
     qwen3_gradients_free(grads);
-    qwen3_adamw_free(opt);
+    delete opt;
 }
 
 // =============================================================================

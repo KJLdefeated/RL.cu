@@ -19,6 +19,7 @@ NVCC      := $(CUDA_HOME)/bin/nvcc
 ARCH      := sm_120
 INCLUDES  := -I include
 NVCCFLAGS := -O2 -std=c++17 $(INCLUDES) --gpu-architecture=$(ARCH)
+CXX       := g++
 
 BUILDDIR  := build
 PYTHON    := python3
@@ -98,6 +99,12 @@ ENGINE_SRCS := $(QWEN3_SRCS) src/kernels/sampler.cu
 $(BUILDDIR)/test_llmengine: $(ENGINE_SRCS) tests/test_llmengine.cu | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
 
+$(BUILDDIR)/test_dataloader: tests/test_dataloader.cpp | $(BUILDDIR)
+	$(CXX) -O2 -std=c++17 -I include -o $@ $<
+
+$(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp | $(BUILDDIR)
+	$(CXX) -O2 -std=c++17 -I include -o $@ $<
+
 $(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@
 
@@ -106,7 +113,7 @@ $(BUILDDIR):
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_loading_weights bench_decode test_llmengine tests generate_refs clean
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -168,6 +175,12 @@ test_fwd_bwd: $(BUILDDIR)/test_fwd_bwd
 test_adamw: $(BUILDDIR)/test_adamw
 	./$(BUILDDIR)/test_adamw
 
+test_dataloader: $(BUILDDIR)/test_dataloader
+	./$(BUILDDIR)/test_dataloader
+
+test_lr_scheduler: $(BUILDDIR)/test_lr_scheduler
+	./$(BUILDDIR)/test_lr_scheduler
+
 test_loading_weights: $(BUILDDIR)/test_loading_weights
 	./$(BUILDDIR)/test_loading_weights
 
@@ -181,8 +194,11 @@ tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_r
 
 # ── PyTorch reference generator ───────────────────────────────────────────────
 
-generate_refs:
-	$(PYTHON) tests/generate_references.py --outdir tests/reference_data
+prepare_sft:
+	$(PYTHON) python_scripts/prepare_data.py --mode sft --output data/sft_train.bin
+
+prepare_grpo:
+	$(PYTHON) python_scripts/prepare_data.py --mode grpo --output data/grpo_train.bin
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 

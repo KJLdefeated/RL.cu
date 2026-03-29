@@ -37,9 +37,19 @@ struct Qwen3LayerWeights {
 };
 
 struct Qwen3Weights {
-    half*  embed_tokens;         // [vocab_size, hidden_size]  token embedding table
-    half*  lm_head;              // [vocab_size, hidden_size]  alias of embed_tokens (tie_word_embeddings=true)
-    float* final_norm;           // [hidden_size]              FP32
+    // --- Flat GPU allocations (one cudaMalloc each) ---
+    // Layout must match Qwen3Gradients pool layout for flat optimizer step.
+    // FP16: per-layer [q, k, v, o, gate, up, down], then embed
+    // FP32: per-layer [input_norm, q_norm, k_norm, post_attn_norm], then final_norm
+    half*  fp16_pool = nullptr;
+    float* fp32_pool = nullptr;
+    size_t fp16_pool_elems = 0;   // total FP16 parameter count
+    size_t fp32_pool_elems = 0;   // total FP32 parameter count
+
+    // --- Convenience pointers (into pools, NOT independent allocations) ---
+    half*  embed_tokens = nullptr; // [vocab_size, hidden_size]
+    half*  lm_head      = nullptr; // alias of embed_tokens (tied)
+    float* final_norm   = nullptr; // [hidden_size]
     std::vector<Qwen3LayerWeights> layers;
 
     // Total GPU memory allocated (bytes)
