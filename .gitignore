@@ -3,6 +3,11 @@ build/
 
 # Model weights
 model_weights/
+checkpoints/
+
+# Profiling
+*.nsys-rep
+*sqlite
 
 # Third-party libraries
 include/third_party/

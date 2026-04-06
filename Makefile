@@ -108,12 +108,17 @@ $(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp | $(BUILDDIR)
 $(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@
 
+TRAIN_SRCS := $(QWEN3_SRCS) src/kernels/adamw.cu
+
+$(BUILDDIR)/train_sft: $(TRAIN_SRCS) tests/train_sft.cu | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo train_sft
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -189,6 +194,10 @@ bench_decode: $(BUILDDIR)/bench_decode
 
 test_llmengine: $(BUILDDIR)/test_llmengine
 	./$(BUILDDIR)/test_llmengine
+
+# Run with default smoke-test settings (100 steps, small batch)
+train_sft: $(BUILDDIR)/train_sft
+	./$(BUILDDIR)/train_sft
 
 tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights test_llmengine
 

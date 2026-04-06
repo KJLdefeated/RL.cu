@@ -428,9 +428,9 @@ int main(int argc, char* argv[]) {
 
     LLMEngine engine(cfg);
 
-    // test_correctness(engine);
-    // test_memory(engine);
-    // test_throughput(engine);
+    test_correctness(engine);
+    test_memory(engine);
+    test_throughput(engine);
     test_bench_realistic(engine);
 
     printf("\n");

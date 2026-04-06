@@ -23,6 +23,11 @@
 // Helpers
 #include "cuda_utils.h"
 
+// Number of tokens processed per lm_head GEMM during training.
+// Keeps the scratch logits buffer manageable ([CHUNK, vocab]) while
+// reducing kernel launches from T/max_batch to T/TRAIN_LOGITS_CHUNK.
+static constexpr int TRAIN_LOGITS_CHUNK = 256;
+
 // In-place elementwise add: x[i] += r[i]
 __global__ static void add_residual_kernel(
     half* __restrict__       x,
@@ -669,6 +674,8 @@ Qwen3TrainState* qwen3_train_state_alloc(const Qwen3Config& c, int B, int S) {
     // Allocate GPU pools
     CUDA_CHECK(cudaMalloc(&s->activation_pool, total_halfs * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&s->lse_pool, total_floats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s->d_logits_train,
+                          (long)TRAIN_LOGITS_CHUNK * c.vocab_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&s->d_token_ids,  T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_target_ids, T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_pos_ids,    T * sizeof(int)));
@@ -720,6 +727,7 @@ void qwen3_train_state_free(Qwen3TrainState* s) {
     if (!s) return;
     cudaFree(s->activation_pool);
     cudaFree(s->lse_pool);
+    cudaFree(s->d_logits_train);
     cudaFree(s->d_token_ids);
     cudaFree(s->d_target_ids);
     cudaFree(s->d_pos_ids);
@@ -855,21 +863,21 @@ void qwen3_forward(
                    m->weights.final_norm, T, c.hidden_size, c.rms_norm_eps, stream);
 
     // --- LM head + log-softmax in chunks ---
-    // d_logits is [max_batch, vocab_size] — process at most max_batch tokens per chunk.
-    const int chunk = m->max_batch;
-    for (int start = 0; start < T; start += chunk) {
-        const int n = (start + chunk <= T) ? chunk : (T - start);
+    // state->d_logits_train is [TRAIN_LOGITS_CHUNK, vocab_size].
+    // TRAIN_LOGITS_CHUNK >> max_batch, so we do far fewer kernel launches.
+    for (int start = 0; start < T; start += TRAIN_LOGITS_CHUNK) {
+        const int n = std::min(TRAIN_LOGITS_CHUNK, T - start);
 
         // Project [n, hidden] → [n, vocab]
         linear_half(m->cublas,
                     m->d_residual + (long)start * c.hidden_size,
                     m->weights.lm_head,
-                    m->d_logits, n, c.vocab_size, c.hidden_size);
+                    state->d_logits_train, n, c.vocab_size, c.hidden_size);
 
         // Log-softmax + gather target log-prob
         log_softmax_gather_kernel<<<n, 256, 0, stream>>>(
             d_log_probs + start,
-            m->d_logits,
+            state->d_logits_train,
             state->d_target_ids + start,
             c.vocab_size);
     }
@@ -1006,26 +1014,25 @@ void qwen3_backward(
     // Zero d_hidden (accumulate gradient for normed final hidden)
     CUDA_CHECK(cudaMemsetAsync(m->d_hidden, 0, (long)T * H * sizeof(half), stream));
 
-    const int chunk = m->max_batch;
-    for (int start = 0; start < T; start += chunk) {
-        const int n = (start + chunk <= T) ? chunk : (T - start);
+    for (int start = 0; start < T; start += TRAIN_LOGITS_CHUNK) {
+        const int n = std::min(TRAIN_LOGITS_CHUNK, T - start);
 
         // Recompute logits for this chunk
         linear_half(m->cublas,
                     m->d_residual + (long)start * H,
                     m->weights.lm_head,
-                    m->d_logits, n, V, H);
+                    state->d_logits_train, n, V, H);
 
-        // Backward log_softmax_gather: overwrite d_logits with gradients
+        // Backward log_softmax_gather: overwrite d_logits_train with gradients
         log_softmax_gather_backward_kernel<<<n, 256, 0, stream>>>(
-            m->d_logits,
+            state->d_logits_train,
             d_log_probs + start,
             state->d_target_ids + start,
             V);
 
         // lm_head backward: dX → d_gate (scratch), dW → dW_embed (accumulated)
         linear_backward_half(m->cublas,
-            m->d_logits,                           // dY [n, V]
+            state->d_logits_train,                 // dY [n, V]
             m->d_residual + (long)start * H,       // X  [n, H]
             m->weights.lm_head,                    // W  [V, H]
             m->d_gate,                             // dX [n, H] scratch

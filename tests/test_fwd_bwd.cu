@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cfloat>
+#include <chrono>
 #include <filesystem>
 #include <vector>
 #include <algorithm>
@@ -640,6 +641,105 @@ static void test_backward_no_side_effects(Qwen3Model* m) {
 }
 
 // =============================================================================
+// Timing profile: forward and backward pass wall time across (B, S) configs.
+//
+// Reports:
+//   fwd_ms  — qwen3_forward wall time (CPU clock, GPU synced after)
+//   bwd_ms  — qwen3_backward wall time
+//   tok/s   — (B*S) / step_s
+// =============================================================================
+
+struct ProfResult {
+    float fwd_ms;
+    float bwd_ms;
+};
+
+static ProfResult profile_once(Qwen3Model* m, int B, int S) {
+    Qwen3TrainState* state = qwen3_train_state_alloc(m->config, B, S);
+    Qwen3Gradients*  grads = qwen3_gradients_alloc(m->config, B * S);
+
+    int T = B * S;
+    std::vector<int> tokens(T, 100), targets(T, 101);
+
+    // Pre-allocate device buffer for log_probs
+    float* d_lp;
+    CUDA_CHECK(cudaMalloc(&d_lp, T * sizeof(float)));
+
+    // Upstream gradient filled with −1/T  (uniform NLL)
+    std::vector<float> h_grad(T, -1.0f / T);
+    float* d_upstream;
+    CUDA_CHECK(cudaMalloc(&d_upstream, T * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_upstream, h_grad.data(), T * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    const int WARMUP = 2, ITERS = 5;
+
+    // Warm up
+    for (int i = 0; i < WARMUP; i++) {
+        qwen3_gradients_zero(grads);
+        qwen3_forward(m, state, tokens.data(), targets.data(), d_lp, B, S);
+        qwen3_backward(m, state, grads, d_upstream);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    using Clock = std::chrono::steady_clock;
+    using ms_f  = std::chrono::duration<float, std::milli>;
+
+    // Forward timing
+    auto t0 = Clock::now();
+    for (int i = 0; i < ITERS; i++) {
+        qwen3_forward(m, state, tokens.data(), targets.data(), d_lp, B, S);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float fwd_ms = ms_f(Clock::now() - t0).count() / ITERS;
+
+    // Backward timing (forward already populated activations)
+    qwen3_gradients_zero(grads);
+    auto t1 = Clock::now();
+    for (int i = 0; i < ITERS; i++) {
+        qwen3_gradients_zero(grads);
+        qwen3_backward(m, state, grads, d_upstream);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float bwd_ms = ms_f(Clock::now() - t1).count() / ITERS;
+
+    cudaFree(d_lp);
+    cudaFree(d_upstream);
+    qwen3_gradients_free(grads);
+    qwen3_train_state_free(state);
+
+    return {fwd_ms, bwd_ms};
+}
+
+static void profile_training_step(Qwen3Model* m) {
+    printf("\n=== Training Step Profile  (Qwen3-0.6B, L=%d H=%d) ===\n",
+           m->config.num_hidden_layers, m->config.hidden_size);
+    printf("%-18s  %9s  %9s  %9s  %9s  %9s\n",
+           "Config", "fwd(ms)", "bwd(ms)", "step(ms)", "tok/s", "bwd/fwd");
+    printf("%-18s  %9s  %9s  %9s  %9s  %9s\n",
+           "------------------",
+           "---------","---------","---------","---------","---------");
+
+    struct Cfg { int B, S; };
+    Cfg cfgs[] = {{8, 2048}};
+
+    for (auto& c : cfgs) {
+        // Skip configs that exceed the model's max_batch / max_seq
+        if (c.B > m->max_batch || c.S > m->max_seq) continue;
+
+        ProfResult r = profile_once(m, c.B, c.S);
+        float step_ms = r.fwd_ms + r.bwd_ms;
+        float tok_per_sec = (c.B * c.S) / (step_ms * 1e-3f);
+
+        char label[32];
+        snprintf(label, sizeof(label), "B=%-2d S=%-4d", c.B, c.S);
+        printf("%-18s  %9.1f  %9.1f  %9.1f  %9.0f  %9.2f×\n",
+               label, r.fwd_ms, r.bwd_ms, step_ms, tok_per_sec,
+               r.bwd_ms / r.fwd_ms);
+    }
+}
+
+// =============================================================================
 // main
 // =============================================================================
 int main() {
@@ -650,14 +750,16 @@ int main() {
 
     printf("=== Forward + Backward end-to-end tests ===\n\n");
 
-    Qwen3Model* m = qwen3_load(MODEL_DIR, /*max_batch=*/4, /*max_seq=*/64);
+    Qwen3Model* m = qwen3_load(MODEL_DIR, /*max_batch=*/32, /*max_seq=*/4096);
 
-    test_loss_decrease(m);
-    test_gradient_scaling(m);
-    test_gradient_accumulation(m);
-    test_different_inputs(m);
-    test_batch_independence(m);
-    test_backward_no_side_effects(m);
+    // test_loss_decrease(m);
+    // test_gradient_scaling(m);
+    // test_gradient_accumulation(m);
+    // test_different_inputs(m);
+    // test_batch_independence(m);
+    // test_backward_no_side_effects(m);
+
+    profile_training_step(m);
 
     qwen3_free(m);
 

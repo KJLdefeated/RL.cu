@@ -120,6 +120,10 @@ struct Qwen3TrainState {
     // Final stage
     half* final_hidden     = nullptr;   // [T, hidden] — after all layers, before final_norm
 
+    // Logits scratch for lm_head (chunked to avoid [T, vocab] allocation)
+    // Size: [TRAIN_LOGITS_CHUNK, vocab_size]
+    half* d_logits_train   = nullptr;
+
     // Device copies of IDs
     int* d_token_ids       = nullptr;   // [T] input token ids
     int* d_target_ids      = nullptr;   // [T] target token ids (for log_prob gathering)

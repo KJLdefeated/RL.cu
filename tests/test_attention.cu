@@ -456,9 +456,9 @@ int main() {
 
     // ── Benchmarks ───────────────────────────────────────────────────────────
     printf("\n=== Prefill benchmarks (warmup=10, iters=200) ===\n");
-    run_prefill_benchmark("Prefill B=1 S=128  H_q=16 H_kv=8",  1, 128,  16, 8);
-    run_prefill_benchmark("Prefill B=1 S=512  H_q=16 H_kv=8",  1, 512,  16, 8);
-    run_prefill_benchmark("Prefill B=1 S=2048 H_q=16 H_kv=8",  1, 2048, 16, 8);
+    // run_prefill_benchmark("Prefill B=1 S=128  H_q=16 H_kv=8",  1, 128,  16, 8);
+    // run_prefill_benchmark("Prefill B=1 S=512  H_q=16 H_kv=8",  1, 512,  16, 8);
+    run_prefill_benchmark("Prefill B=8 S=2048 H_q=16 H_kv=8",  8, 2048, 16, 8);
 
     return all_pass ? 0 : 1;
 }
