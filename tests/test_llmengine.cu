@@ -279,62 +279,25 @@ static void test_throughput(LLMEngine& engine) {
         {engine.tokenizer->chat_prompt("Hello!")}, greedy(16));
 
     // ── 3a. Single-request latency ────────────────────────────────────────────
-    printf("\n  ── Single-request latency (greedy, max_new=128) ──\n");
-    {
-        auto res = run_bench(engine, 1, 128);
-        printf("  batch=1  %7.0f tok/s  (%.0f ms total, %d output tokens)\n",
-               res.toks_per_sec(), res.wall_s * 1e3, res.num_output_tokens);
-    }
+    // printf("\n  ── Single-request latency (greedy, max_new=128) ──\n");
+    // {
+    //     auto res = run_bench(engine, 1, 128);
+    //     printf("  batch=1  %7.0f tok/s  (%.0f ms total, %d output tokens)\n",
+    //            res.toks_per_sec(), res.wall_s * 1e3, res.num_output_tokens);
+    // }
 
     // ── 3b. Batch sweep ───────────────────────────────────────────────────────
-    printf("\n  ── Batch throughput sweep (greedy, max_new=128) ──\n");
+    printf("\n  ── Batch throughput sweep ──\n");
     printf("  %6s  %10s  %12s  %12s\n",
            "batch", "tok/s", "ms/request", "output_tokens");
 
     BenchResult best{};
-    for (int batch : {64, 128, 256}) {
+    for (int batch : {256}) {
         if (batch > engine.config.max_num_seqs) break;
         auto res = run_bench(engine, batch, 1024);
         printf("  %6d  %10.0f  %12.1f  %12d\n",
                batch, res.toks_per_sec(), res.ms_per_req(), res.num_output_tokens);
         if (res.toks_per_sec() > best.toks_per_sec()) best = res;
-    }
-
-    // ── 3c. nano-vllm comparison ──────────────────────────────────────────────
-    //
-    // nano-vllm benchmark protocol (benchmark_throughput.py):
-    //   Model  : Qwen2.5-7B
-    //   GPU    : NVIDIA A100 80GB
-    //   Dataset: ShareGPT (varied length prompts)
-    //   Metric : output_tokens / total_wall_clock_time
-    //
-    // Reported numbers (from nano-vllm README, Jan 2025):
-    //   batch = 64  →  ~1 800 tok/s
-    //   batch = 128 →  ~2 200 tok/s
-    //   batch = 256 →  ~2 600 tok/s
-    //
-    // Scaling expectations to this setup:
-    //   Model scale:  0.6B vs 7B ≈ 12×  faster (memory-BW dominant for decode)
-    //   GPU scale:    RTX PRO 6000 Blackwell vs A100  ≈ 1.5–2× BW advantage
-    //   Expected:     ~1 800 × 12 × 1.8 ≈ 38 000 tok/s at equivalent batch
-    //   Realistic cap (BW-bound, small batch):  ~8 000–20 000 tok/s
-    //
-    // The normalised figure (÷12) lets you compare apples-to-apples against
-    // nano-vllm's 7B numbers on A100.
-    {
-        int cmp_batch = std::min(8, engine.config.max_num_seqs);
-        auto res = run_bench(engine, cmp_batch, 200);
-        double scaled = res.toks_per_sec() / 12.0;   // normalise to 7B equivalent
-
-        printf("\n  ── nano-vllm comparison ──\n");
-        printf("  nano-vllm  (Qwen2.5-7B / A100, batch=256): ~2 600 tok/s\n");
-        printf("  This engine (Qwen3-0.6B / Blackwell, batch=%d): %.0f tok/s\n",
-               cmp_batch, res.toks_per_sec());
-        printf("  Normalised to 7B-equivalent (÷12):           %.0f tok/s\n", scaled);
-        printf("  %s vs nano-vllm on same GPU class\n",
-               scaled >= 2600.0 ? "FASTER" : "SLOWER");
-        printf("BENCH_RESULT: tok/s=%.2f  batch=%d  max_new=200\n",
-               res.toks_per_sec(), cmp_batch);
     }
 }
 
@@ -420,9 +383,9 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg(model_dir);
-    cfg.max_num_seqs           = 256;
+    cfg.max_num_seqs           = 512;
     cfg.max_model_len          = 2048;
-    cfg.max_num_batched_tokens = 32768;
+    cfg.max_num_batched_tokens = 262144;
     cfg.gpu_memory_utilization = 0.90f;
     cfg.enforce_eager          = false;
 

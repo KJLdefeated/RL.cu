@@ -3,12 +3,16 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// CUTLASS stream-K GEMM — FP16 in/out, FP32 accumulation.
+// handle is kept for API compatibility (backward pass still uses cuBLAS).
+// stream defaults to 0 (default CUDA stream) when not provided.
 void linear_half(
     cublasHandle_t handle,
     const half* input,   // [M, K]
     const half* weight,  // [N, K] (row-major, transposed for GEMM)
     half*       output,  // [M, N]
-    int M, int N, int K
+    int M, int N, int K,
+    cudaStream_t stream = 0
 );
 
 // Backward pass for linear layer: Y = X @ W^T

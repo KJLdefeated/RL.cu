@@ -315,13 +315,13 @@ Qwen3Weights load_weights(const std::string& model_dir, const Qwen3Config& cfg) 
     half* hp2 = w.fp16_pool;
     for (int i = 0; i < L; i++) {
         auto& lw = w.layers[i];
-        lw.q_proj    = hp2; hp2 += q_proj_sz;
-        lw.k_proj    = hp2; hp2 += k_proj_sz;
-        lw.v_proj    = hp2; hp2 += v_proj_sz;
-        lw.o_proj    = hp2; hp2 += o_proj_sz;
-        lw.gate_proj = hp2; hp2 += gate_proj_sz;
-        lw.up_proj   = hp2; hp2 += up_proj_sz;
-        lw.down_proj = hp2; hp2 += down_proj_sz;
+        lw.q_proj      = hp2; lw.qkv_proj = hp2; hp2 += q_proj_sz;
+        lw.k_proj      = hp2; hp2 += k_proj_sz;
+        lw.v_proj      = hp2; hp2 += v_proj_sz;
+        lw.o_proj      = hp2; hp2 += o_proj_sz;
+        lw.gate_proj   = hp2; lw.gate_up_proj = hp2; hp2 += gate_proj_sz;
+        lw.up_proj     = hp2; hp2 += up_proj_sz;
+        lw.down_proj   = hp2; hp2 += down_proj_sz;
     }
     w.embed_tokens = hp2;
     w.lm_head = cfg.tie_word_embeddings ? w.embed_tokens : (hp2 + embed_sz);  // tied

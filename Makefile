@@ -17,101 +17,106 @@
 CUDA_HOME := /usr/local/cuda-12.8
 NVCC      := $(CUDA_HOME)/bin/nvcc
 ARCH      := sm_120
-INCLUDES  := -I include
-NVCCFLAGS := -O2 -std=c++17 $(INCLUDES) --gpu-architecture=$(ARCH)
+CUTLASS_INC := third_party/cutlass/include
+INCLUDES  := -I include -I$(CUTLASS_INC)
+NVCCFLAGS := -O2 -std=c++17 $(INCLUDES) --gpu-architecture=$(ARCH) \
+             --expt-relaxed-constexpr -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1
 CXX       := g++
 
 BUILDDIR  := build
 PYTHON    := python3
 
+# All headers — any change forces a rebuild of binaries that include them
+HEADERS   := $(shell find include -name "*.h" -o -name "*.cuh")
+
 # ── Kernel test binaries ───────────────────────────────────────────────────────
 
-$(BUILDDIR)/test_rmsnorm: src/kernels/rmsnorm.cu tests/test_rmsnorm.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_rmsnorm: src/kernels/rmsnorm.cu tests/test_rmsnorm.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_softmax: src/kernels/softmax.cu tests/test_softmax.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_softmax: src/kernels/softmax.cu tests/test_softmax.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_swiglu: src/kernels/swiglu.cu tests/test_swiglu.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_swiglu: src/kernels/swiglu.cu tests/test_swiglu.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_attention: src/kernels/attention.cu tests/test_attention.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_attention: src/kernels/attention.cu tests/test_attention.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_kv_cache: src/model/kv_cache.cu tests/test_kv_cache.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_kv_cache: src/model/kv_cache.cu tests/test_kv_cache.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_rope: src/kernels/rope.cu tests/test_rope.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_rope: src/kernels/rope.cu tests/test_rope.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_embedding: src/kernels/embedding.cu tests/test_embedding.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_embedding: src/kernels/embedding.cu tests/test_embedding.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_linear_backward: src/kernels/linear.cu tests/test_linear_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_linear_backward: src/kernels/linear.cu tests/test_linear_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_embedding_backward: src/kernels/embedding.cu tests/test_embedding_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_embedding_backward: src/kernels/embedding.cu tests/test_embedding_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_rmsnorm_backward: src/kernels/rmsnorm.cu tests/test_rmsnorm_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_rmsnorm_backward: src/kernels/rmsnorm.cu tests/test_rmsnorm_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_swiglu_backward: src/kernels/swiglu.cu tests/test_swiglu_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_swiglu_backward: src/kernels/swiglu.cu tests/test_swiglu_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_rope_backward: src/kernels/rope.cu tests/test_rope_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_rope_backward: src/kernels/rope.cu tests/test_rope_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-$(BUILDDIR)/test_attention_backward: src/kernels/attention.cu tests/test_attention_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_attention_backward: src/kernels/attention.cu tests/test_attention_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
 QWEN3_SRCS := src/model/qwen3.cu src/model/kv_cache.cu \
               src/kernels/rmsnorm.cu src/kernels/rope.cu src/kernels/attention.cu \
               src/kernels/swiglu.cu src/kernels/embedding.cu src/kernels/linear.cu \
               src/kernels/config.cpp src/kernels/weights.cpp
 
-$(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_qwen3_forward: $(QWEN3_SRCS) tests/test_qwen3_forward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_qwen3_forward: $(QWEN3_SRCS) tests/test_qwen3_forward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_qwen3_backward: $(QWEN3_SRCS) tests/test_qwen3_backward.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_qwen3_backward: $(QWEN3_SRCS) tests/test_qwen3_backward.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_fwd_bwd: $(QWEN3_SRCS) tests/test_fwd_bwd.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_fwd_bwd: $(QWEN3_SRCS) tests/test_fwd_bwd.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_adamw: $(QWEN3_SRCS) src/kernels/adamw.cu tests/test_adamw.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_adamw: $(QWEN3_SRCS) src/kernels/adamw.cu tests/test_adamw.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/bench_decode: $(QWEN3_SRCS) tests/bench_decode.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/bench_decode: $(QWEN3_SRCS) tests/bench_decode.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
 ENGINE_SRCS := $(QWEN3_SRCS) src/kernels/sampler.cu
 
-$(BUILDDIR)/test_llmengine: $(ENGINE_SRCS) tests/test_llmengine.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/test_llmengine: $(ENGINE_SRCS) tests/test_llmengine.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
-$(BUILDDIR)/test_dataloader: tests/test_dataloader.cpp | $(BUILDDIR)
-	$(CXX) -O2 -std=c++17 -I include -o $@ $<
+$(BUILDDIR)/test_dataloader: tests/test_dataloader.cpp $(HEADERS) | $(BUILDDIR)
+	$(CXX) -O2 -std=c++17 -I include -o $@ $(filter-out $(HEADERS),$^)
 
-$(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp | $(BUILDDIR)
-	$(CXX) -O2 -std=c++17 -I include -o $@ $<
+$(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp $(HEADERS) | $(BUILDDIR)
+	$(CXX) -O2 -std=c++17 -I include -o $@ $(filter-out $(HEADERS),$^)
 
-$(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@
+$(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
 TRAIN_SRCS := $(QWEN3_SRCS) src/kernels/adamw.cu
 
-$(BUILDDIR)/train_sft: $(TRAIN_SRCS) tests/train_sft.cu | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcublas
+$(BUILDDIR)/train_sft: $(TRAIN_SRCS) tests/train_sft.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)

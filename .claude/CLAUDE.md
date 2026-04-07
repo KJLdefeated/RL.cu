@@ -1,18 +1,23 @@
 # GRPO-CUDA Project Memory
 
-## Current Status (as of 2026-03-09)
+## Current Status (as of 2026-04-07)
 - **Phase 1 COMPLETE (correctness)**: LLMEngine all 11/11 tests pass, Sampler kernel done
-- **Performance gap**: ~30% of vLLM throughput (125 tok/s vs ~400+ batch=1; 819 tok/s vs ~2700+ batch=16)
-- **Next step 1**: Efficiency optimization (close the vLLM gap — see plan below)
+- **Throughput (256 seqs)**: 1356 tok/s (up from 821 tok/s baseline) — ~18% of nano-vllm target
+- **Next step 1**: Close remaining throughput gap (Flash Decoding, fused norm+proj)
 - **Next step 2**: Phase 2 SFT training infrastructure
 
-## Efficiency Optimization Plan (to close vLLM gap)
-Priority areas to investigate:
-1. **CUDA graph execution**: Graphs are captured (buckets 1,2,4,8..128) but `qwen3_decode` still uses eager path — wire up graph replay
-2. **cuBLAS tuning**: Check GEMM algorithm selection (cublasGemmEx with ALGO hints), tensor core utilization
-3. **Kernel fusion**: Fuse RMSNorm+linear, avoid extra memory round-trips between layers
-4. **KV cache layout**: Current paged-decode is single-thread per (seq, head) — explore warp-level parallelism
-5. **Memory bandwidth**: Profile with Nsight; check if decode is memory-bound; consider FP8 KV cache
+## Optimizations Applied (see docs/ENGINE.md for details)
+1. **CUDA graph execution** — decode buckets 1,2,4,8..256 captured and replayed (DONE)
+2. **Gumbel-max sampler v3** — single-pass argmax(logit/T + Gumbel), 51 µs vs 679 µs (DONE)
+3. **Continuous batching** — two-phase decode+prefill per step, avg batch now tracks queue depth (DONE)
+4. **Fused QKV projection** — 3 GEMMs → 1 per layer (qkv_proj alias, zero extra memory) (DONE)
+5. **Fused gate+up projection** — 2 GEMMs → 1 per layer (gate_up_proj alias) (DONE)
+
+## Remaining Gap vs nano-vllm (7411 tok/s)
+Priority areas:
+1. **Flash Decoding (split-K)**: current paged decode is 1 thread/(seq,head) — expected 5–10× attn speedup
+2. **Fused RMSNorm + linear**: avoid [T,1024] HBM write/read between norm and GEMM (2 fusion points/layer)
+3. **cuBLAS GEMM tuning**: thin-matrix performance at small B
 6. **Continuous batching**: Verify scheduler fills GPU efficiently; check batch padding overhead
 7. **Flash attention decode**: Replace single-thread decode with a proper FlashDecoding kernel (split-K)
 

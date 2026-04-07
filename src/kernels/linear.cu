@@ -3,36 +3,51 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <cstdio>
+
+// =============================================================================
+// linear_half — forward projection: output[M,N] = input[M,K] × weight^T[K,N]
+// Uses cuBLAS GemmEx with FP32 accumulation and tensor cores.
+// =============================================================================
 
 void linear_half(
     cublasHandle_t handle,
     const half* input,
     const half* weight,
     half*       output,
-    int M, int N, int K
+    int M, int N, int K,
+    cudaStream_t stream
 ) {
     const float alpha = 1.0f;
     const float beta  = 0.0f;
 
+    // cuBLAS is column-major; to compute C[M,N] = A[M,K] × B^T[K,N] in row-major
+    // we compute C^T[N,M] = B[N,K] × A^T[K,M]:
+    //   op(B) = N (no transpose), dims (N × K)
+    //   op(A) = T (transpose),   dims (K × M)
+    //   result: C^T[N, M]
     cublasStatus_t status = cublasGemmEx(
         handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,   // op(A)=weight^T, op(B)=input
-        N, M, K,                     // m, n, k
+        CUBLAS_OP_T, CUBLAS_OP_N,   // op(B)=N, op(A)=T (col-major view)
+        N, M, K,
         &alpha,
-        weight, CUDA_R_16F, K,       // A, type, lda
-        input,  CUDA_R_16F, K,       // B, type, ldb
+        weight, CUDA_R_16F, K,      // B[N,K], ldb=K
+        input,  CUDA_R_16F, K,      // A[M,K], lda=K
         &beta,
-        output, CUDA_R_16F, N,       // C, type, ldc
-        CUDA_R_32F,                  // compute type (FP32 accumulation)
+        output, CUDA_R_16F, N,      // C[M,N], ldc=N
+        CUDA_R_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
-
     if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cublasGemmEx failed: status=%d M=%d N=%d K=%d\n",
+        fprintf(stderr, "linear_half cublasGemmEx failed: status=%d  M=%d N=%d K=%d\n",
                 (int)status, M, N, K);
-        throw std::runtime_error("cublasGemmEx failed in linear_half");
+        throw std::runtime_error("linear_half: cublasGemmEx failed");
     }
 }
+
+// =============================================================================
+// linear_backward_half — weight + input gradients (cuBLAS; large M in training)
+// =============================================================================
 
 void linear_backward_half(
     cublasHandle_t handle,
@@ -46,58 +61,43 @@ void linear_backward_half(
     const float alpha = 1.0f;
     cublasStatus_t status;
 
-    // ---- dX = dY @ W  [M,N] × [N,K] → [M,K] ----
-    // Row-major: dX = dY × W
-    // cuBLAS col-major: dX^T = W^T × dY^T
-    //   op(A)=W^T  → CUBLAS_OP_T on W[N,K], lda=K
-    //   BUT we want W not transposed this time:
-    //   dX[M,K] = dY[M,N] × W[N,K]
-    //   Col-major: dX^T[K,M] = W^T[K,N] × dY^T[N,M]
-    //   → op(A)=CUBLAS_OP_N on W[N,K] (col-major sees [K,N]), m=K, n=M, k=N
+    // dX = dY @ W  →  col-major: dX^T[K,M] = W^T[K,N] × dY^T[N,M]
     if (dX) {
         const float beta_dx = 0.0f;
         status = cublasGemmEx(
             handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,   // W not transposed, dY not transposed
-            K, M, N,                     // m, n, k
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            K, M, N,
             &alpha,
-            W,  CUDA_R_16F, K,          // A=[N,K] col-major sees [K,N], lda=K
-            dY, CUDA_R_16F, N,          // B=[M,N] col-major sees [N,M], ldb=N
+            W,  CUDA_R_16F, K,
+            dY, CUDA_R_16F, N,
             &beta_dx,
-            dX, CUDA_R_16F, K,          // C=[M,K] col-major sees [K,M], ldc=K
+            dX, CUDA_R_16F, K,
             CUDA_R_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP
         );
         if (status != CUBLAS_STATUS_SUCCESS) {
-            fprintf(stderr, "linear_backward dX failed: status=%d M=%d N=%d K=%d\n",
-                    (int)status, M, N, K);
+            fprintf(stderr, "linear_backward dX failed: status=%d\n", (int)status);
             throw std::runtime_error("cublasGemmEx failed in linear_backward (dX)");
         }
     }
 
-    // ---- dW = dY^T @ X  [N,M] × [M,K] → [N,K] ----
-    // Row-major: dW = dY^T × X
-    // Col-major: dW^T[K,N] = X^T[K,M] × dY[M,N]
-    //   op(A)=CUBLAS_OP_N on X[M,K] (col-major [K,M]), m=K, n=N, k=M
-    //   op(B)=CUBLAS_OP_N on dY[M,N] (col-major [N,M])
-    //   Wait — that gives [K,N] = [K,M]×[M,N] ✓
-    // beta=1 to accumulate gradients across micro-batches
+    // dW = dY^T @ X  →  col-major: dW^T[K,N] = X^T[K,M] × dY[M,N]
     const float beta_dw = 1.0f;
     status = cublasGemmEx(
         handle,
-        CUBLAS_OP_N, CUBLAS_OP_T,   // X not transposed, dY transposed
-        K, N, M,                     // m, n, k
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        K, N, M,
         &alpha,
-        X,  CUDA_R_16F, K,          // A=[M,K] col-major sees [K,M], lda=K
-        dY, CUDA_R_16F, N,          // B=[M,N] col-major sees [N,M], ldb=N → op_T sees [M,N]
+        X,  CUDA_R_16F, K,
+        dY, CUDA_R_16F, N,
         &beta_dw,
-        dW, CUDA_R_16F, K,          // C=[N,K] col-major sees [K,N], ldc=K
+        dW, CUDA_R_16F, K,
         CUDA_R_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
     if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "linear_backward dW failed: status=%d M=%d N=%d K=%d\n",
-                (int)status, M, N, K);
+        fprintf(stderr, "linear_backward dW failed: status=%d\n", (int)status);
         throw std::runtime_error("cublasGemmEx failed in linear_backward (dW)");
     }
 }

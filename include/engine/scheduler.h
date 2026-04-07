@@ -77,54 +77,22 @@ public:
         }
     }
 
-    // Returns {batch, is_prefill}.
-    std::pair<std::vector<Sequence*>, bool> schedule() {
-        std::vector<Sequence*> scheduled;
+    // ── Phase 1 of step(): schedule decode for all currently running sequences.
+    // Preempts from the back of `running` when the KV pool is too full to store
+    // one new token per sequence.  Populates preempted_slots_ as a side-effect;
+    // caller must free model KV state for those slots before calling schedule_prefill().
+    std::vector<Sequence*> schedule_decode() {
         preempted_slots_.clear();
+        std::vector<Sequence*> scheduled;
+        if (running.empty()) return scheduled;
 
-        // Prefill
-        // Track post-prefill may_append reservations: a sequence needs 1 extra block
-        // if its size after the first generated token will cross a block boundary,
-        // i.e., if current size % block_size == 0 (so size+1 % block_size == 1).
-        int num_seqs = 0;
-        int num_batched_tokens = 0;
-        int prefill_blocks_reserved = 0;  // post-prefill may_append blocks needed
-        while (!waiting.empty() && num_seqs < max_num_seqs) {
-            Sequence* seq = waiting.front();
-            int uncached = seq->size() - seq->num_cached_tokens;
-            int needs_postprefill_block = (seq->size() % seq->block_size == 0) ? 1 : 0;
-            if (num_batched_tokens + uncached > max_num_batched_tokens ||
-                !block_manager.can_allocate(*seq) ||
-                block_manager.num_free_blocks() - (int)seq->num_blocks() - prefill_blocks_reserved < needs_postprefill_block) {
-                break;
-            }
-            waiting.pop_front();
-            block_manager.allocate(*seq);
-            prefill_blocks_reserved += needs_postprefill_block;
-            seq->status = SeqStatus::RUNNING;
-            seq->batch_slot = alloc_slot();
-            running.push_back(seq);
-            scheduled.push_back(seq);
-            num_batched_tokens += uncached;
-            num_seqs++;
-        }
-        if (!scheduled.empty()) {
-            return {scheduled, true};
-        }
-
-        // Decode pass
-        // Collect all running sequences; preempt from the back if we're OOM.
-        // Track "blocks_reserved": blocks already committed to scheduled seqs
-        // but not yet physically allocated (allocation happens in postprocess).
         std::deque<Sequence*> to_process = running;
         running.clear();
         int blocks_reserved = 0;
         while (!to_process.empty()) {
             Sequence* seq = to_process.front();
             to_process.pop_front();
-            // Does the next token start a new block? (current size is at boundary)
             int needs_block = (seq->size() % seq->block_size == 0) ? 1 : 0;
-            // Ensure there's space after accounting for already-reserved blocks.
             while (block_manager.num_free_blocks() - blocks_reserved < needs_block) {
                 if (!to_process.empty()) {
                     preempt(to_process.back());
@@ -141,6 +109,42 @@ public:
                 scheduled.push_back(seq);
             }
         }
-        return {scheduled, false};
+        return scheduled;
+    }
+
+    // ── Phase 2 of step(): fill vacant batch slots from the waiting queue.
+    // Called after schedule_decode() + postprocess() so that slots freed by
+    // finished/preempted sequences are available.
+    // Fills up to (max_num_seqs - running.size()) new sequences, subject to
+    // token-budget and KV-block availability.
+    std::vector<Sequence*> schedule_prefill() {
+        if (waiting.empty()) return {};
+        int available_slots = max_num_seqs - (int)running.size();
+        if (available_slots <= 0) return {};
+
+        std::vector<Sequence*> scheduled;
+        int num_batched_tokens = 0;
+        int prefill_blks_rsvd  = 0;  // post-prefill may_append blocks reserved
+        while (!waiting.empty() && (int)scheduled.size() < available_slots) {
+            Sequence* seq = waiting.front();
+            int uncached = seq->size() - seq->num_cached_tokens;
+            int needs_postprefill = (seq->size() % seq->block_size == 0) ? 1 : 0;
+            if (num_batched_tokens + uncached > max_num_batched_tokens ||
+                !block_manager.can_allocate(*seq) ||
+                block_manager.num_free_blocks()
+                    - (int)seq->num_blocks()
+                    - prefill_blks_rsvd < needs_postprefill) {
+                break;
+            }
+            waiting.pop_front();
+            block_manager.allocate(*seq);
+            prefill_blks_rsvd  += needs_postprefill;
+            seq->status         = SeqStatus::RUNNING;
+            seq->batch_slot     = alloc_slot();
+            running.push_back(seq);
+            scheduled.push_back(seq);
+            num_batched_tokens += uncached;
+        }
+        return scheduled;
     }
 };

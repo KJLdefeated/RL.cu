@@ -48,6 +48,8 @@ struct Config {
         tokenizer_path = model_dir + "/tokenizer.json";
         model_config = load_config(model_dir);
         eos = model_config.vocab_size - 1; // assuming EOS token is the last token in vocab
-        num_kv_blocks = (max_model_len + kv_block_size - 1) / kv_block_size;
+        // num_kv_blocks is set by compute_kv_budget() in ModelRunner based on actual
+        // free GPU memory.  Leave at -1 so block_manager is not pre-constructed with
+        // a wrong pool size (the old formula gave blocks-per-seq, not total pool size).
     }
 };

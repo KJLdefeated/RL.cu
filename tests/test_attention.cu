@@ -360,6 +360,80 @@ static bool run_decode_test(
 // ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------
+static void run_decode_benchmark(
+    const char* name,
+    int num_seqs, int context_len, int H_q, int H_kv,
+    int D = 128, int BLOCK_SIZE = 16,
+    int warmup = 20, int iters = 500
+) {
+    const int blocks_per_seq    = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int total_phys_blocks = num_seqs * blocks_per_seq;
+
+    const long Q_total    = (long)num_seqs * H_q * D;
+    const long cache_elem = (long)total_phys_blocks * H_kv * BLOCK_SIZE * D;
+
+    half *d_q, *d_k, *d_v, *d_out;
+    int  *d_block_tables, *d_seq_lens;
+
+    CUDA_CHECK(cudaMalloc(&d_q,           Q_total    * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k,           cache_elem * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_v,           cache_elem * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_out,         Q_total    * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_block_tables, num_seqs * blocks_per_seq * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_seq_lens,    num_seqs * sizeof(int)));
+
+    // Identity block table + uniform context length
+    {
+        int* h_bt = new int[num_seqs * blocks_per_seq];
+        int* h_sl = new int[num_seqs];
+        for (int s = 0; s < num_seqs; s++) {
+            h_sl[s] = context_len;
+            for (int b = 0; b < blocks_per_seq; b++)
+                h_bt[s * blocks_per_seq + b] = s * blocks_per_seq + b;
+        }
+        CUDA_CHECK(cudaMemcpy(d_block_tables, h_bt,
+            num_seqs * blocks_per_seq * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_seq_lens, h_sl,
+            num_seqs * sizeof(int), cudaMemcpyHostToDevice));
+        delete[] h_bt;
+        delete[] h_sl;
+    }
+
+    cudaEvent_t ev0, ev1;
+    CUDA_CHECK(cudaEventCreate(&ev0));
+    CUDA_CHECK(cudaEventCreate(&ev1));
+
+    for (int i = 0; i < warmup; i++)
+        launch_paged_attention_decode(d_q, d_k, d_v, d_out,
+            d_block_tables, d_seq_lens,
+            num_seqs, H_q, H_kv, D, blocks_per_seq, BLOCK_SIZE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaEventRecord(ev0));
+    for (int i = 0; i < iters; i++)
+        launch_paged_attention_decode(d_q, d_k, d_v, d_out,
+            d_block_tables, d_seq_lens,
+            num_seqs, H_q, H_kv, D, blocks_per_seq, BLOCK_SIZE);
+    CUDA_CHECK(cudaEventRecord(ev1));
+    CUDA_CHECK(cudaEventSynchronize(ev1));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+    const float us = ms * 1000.0f / iters;
+
+    // Memory traffic: K read + V read + Q read + O write
+    const double bytes_kv = 2.0 * (long)num_seqs * H_kv * context_len * D * sizeof(half);
+    const double bytes_qo = 2.0 * (long)num_seqs * H_q  * D * sizeof(half);
+    const double gbs = (bytes_kv + bytes_qo) / (us * 1e-6) / 1e9;
+
+    printf("[BENCH] %-55s  %7.2f us  %6.1f GB/s\n", name, us, gbs);
+
+    CUDA_CHECK(cudaEventDestroy(ev0));
+    CUDA_CHECK(cudaEventDestroy(ev1));
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_out);
+    cudaFree(d_block_tables); cudaFree(d_seq_lens);
+}
+
 static void run_prefill_benchmark(
     const char* name, int B, int S, int H_q, int H_kv,
     int D = 128, int warmup = 10, int iters = 200
@@ -459,6 +533,15 @@ int main() {
     // run_prefill_benchmark("Prefill B=1 S=128  H_q=16 H_kv=8",  1, 128,  16, 8);
     // run_prefill_benchmark("Prefill B=1 S=512  H_q=16 H_kv=8",  1, 512,  16, 8);
     run_prefill_benchmark("Prefill B=8 S=2048 H_q=16 H_kv=8",  8, 2048, 16, 8);
+
+    printf("\n=== Decode benchmarks — warp-parallel (warmup=20, iters=500) ===\n");
+    run_decode_benchmark("Decode  B=1   ctx=512   H_q=16 H_kv=8",  1,   512, 16, 8);
+    run_decode_benchmark("Decode  B=1   ctx=2048  H_q=16 H_kv=8",  1,  2048, 16, 8);
+    run_decode_benchmark("Decode  B=16  ctx=512   H_q=16 H_kv=8", 16,   512, 16, 8);
+    run_decode_benchmark("Decode  B=16  ctx=2048  H_q=16 H_kv=8", 16,  2048, 16, 8);
+    run_decode_benchmark("Decode  B=64  ctx=512   H_q=16 H_kv=8", 64,   512, 16, 8);
+    run_decode_benchmark("Decode  B=64  ctx=2048  H_q=16 H_kv=8", 64,  2048, 16, 8);
+    run_decode_benchmark("Decode  B=128 ctx=2048  H_q=16 H_kv=8",128,  2048, 16, 8);
 
     return all_pass ? 0 : 1;
 }

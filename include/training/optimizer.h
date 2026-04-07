@@ -115,17 +115,29 @@ public:
     float* get_final_norm_m() const { return fp32_m_ + fp32_final_norm_offset(); }
     float* get_final_norm_v() const { return fp32_v_ + fp32_final_norm_offset(); }
 
-    // --- Optimizer step: 2 kernel launches ---
+    // --- Optimizer step: 3 kernel launches ---
     void step(Qwen3Gradients* grads, cudaStream_t stream = 0) {
         step_++;
         float bc1 = 1.0f - powf(beta1, (float)step_);
         float bc2 = 1.0f - powf(beta2, (float)step_);
 
-        // Launch 1: all FP16 params (projections + embed), with weight decay
+        // Launch 1a: projection weights only (with weight decay)
+        const size_t proj_n = per_layer_fp16_ * (size_t)model_->config.num_hidden_layers;
         launch_adamw_fp16(
             fp16_master_, model_->weights.fp16_pool, grads->half_pool,
-            fp16_m_, fp16_v_, (int)n16_,
+            fp16_m_, fp16_v_, (int)proj_n,
             lr, beta1, beta2, eps, weight_decay, bc1, bc2, stream);
+
+        // Launch 1b: embedding weights (no weight decay — shrinking pretrained
+        //            embeddings toward zero destabilises token representations)
+        const size_t embed_off = proj_n;
+        const size_t embed_n   = n16_ - proj_n;  // vocab_size * hidden_size
+        launch_adamw_fp16(
+            fp16_master_ + embed_off,
+            model_->weights.fp16_pool + embed_off,
+            grads->half_pool + embed_off,
+            fp16_m_ + embed_off, fp16_v_ + embed_off, (int)embed_n,
+            lr, beta1, beta2, eps, /*weight_decay=*/0.0f, bc1, bc2, stream);
 
         // Launch 2: all FP32 params (norms), no weight decay
         launch_adamw_fp32(

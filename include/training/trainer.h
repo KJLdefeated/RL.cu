@@ -39,6 +39,8 @@ struct TrainingConfig {
     float       opt_eps           = 1e-8f;
     float       weight_decay      = 0.01f;
     float       min_lr            = 0.0f;
+    float       max_grad_norm     = 1.0f;   // gradient clipping; 0 = disabled
+    bool        freeze_embed      = false;  // do not update embed_tokens weights
     int         warmup_steps      = 100;
     int         total_steps       = 1000;
     int         logging_steps     = 10;
@@ -94,6 +96,52 @@ struct TrainingConfig {
 __global__ static void scale_grad_kernel(float* __restrict__ grad, float scale, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) grad[i] *= scale;
+}
+
+// Compute sum of squared elements from a half buffer (FP32 accumulation).
+// Atomically adds into *out (must be zeroed by caller).
+__global__ static void sum_sq_half_kernel(
+    const half* __restrict__ g, float* __restrict__ out, int n
+) {
+    float partial = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float v = __half2float(g[i]);
+        partial += v * v;
+    }
+    // Warp reduce
+    #pragma unroll
+    for (int mask = 16; mask >= 1; mask >>= 1)
+        partial += __shfl_xor_sync(0xFFFFFFFF, partial, mask);
+    if (threadIdx.x % 32 == 0)
+        atomicAdd(out, partial);
+}
+
+// Compute sum of squared elements from a float buffer.
+__global__ static void sum_sq_float_kernel(
+    const float* __restrict__ g, float* __restrict__ out, int n
+) {
+    float partial = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float v = g[i];
+        partial += v * v;
+    }
+    #pragma unroll
+    for (int mask = 16; mask >= 1; mask >>= 1)
+        partial += __shfl_xor_sync(0xFFFFFFFF, partial, mask);
+    if (threadIdx.x % 32 == 0)
+        atomicAdd(out, partial);
+}
+
+// Scale a half buffer in-place.
+__global__ static void scale_half_kernel(half* __restrict__ g, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) g[i] = __float2half(__half2float(g[i]) * scale);
+}
+
+// Scale a float buffer in-place.
+__global__ static void scale_float_kernel(float* __restrict__ g, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) g[i] *= scale;
 }
 
 // =============================================================================
@@ -214,6 +262,21 @@ public:
             qwen3_backward(model_, state_, grads_, d_loss_grad_);
         }
 
+        // Optionally freeze embedding gradients before clipping/optimizer.
+        // embed_tokens is the last embed_sz elements of half_pool.
+        if (config_.freeze_embed) {
+            const Qwen3Config& c = model_->config;
+            const size_t embed_elems = (size_t)c.vocab_size * c.hidden_size;
+            const size_t half_elems  = grads_->half_pool_bytes / sizeof(half);
+            half* embed_grad = grads_->half_pool + (half_elems - embed_elems);
+            CUDA_CHECK(cudaMemset(embed_grad, 0, embed_elems * sizeof(half)));
+        }
+
+        // Gradient clipping: scale all gradients so global L2 norm <= max_grad_norm.
+        if (config_.max_grad_norm > 0.0f) {
+            clip_grad_norm_(grads_, config_.max_grad_norm);
+        }
+
         // One optimizer step after all micro-batches
         optimizer_.step(grads_);
 
@@ -235,6 +298,7 @@ protected:
     float*           d_loss_grad_  = nullptr;  // [micro_T] upstream gradient (pre-scale)
     int*             d_loss_mask_  = nullptr;  // [micro_T]
     int              buf_B_ = 0, buf_S_ = 0;
+    float*           d_norm_acc_ = nullptr; // [1] device scalar for grad norm accumulation
 
     // Subclass implements: compute loss on one micro-batch, write gradient into d_loss_grad_.
     // Do NOT scale by grad_accum_steps — the base class handles that.
@@ -245,6 +309,39 @@ protected:
 
     virtual void save_checkpoint(int step) {
         printf("[Trainer] Checkpoint at step %d (not yet implemented)\n", step);
+    }
+
+    // Clip all gradients (half_pool + float_pool) so global L2 norm <= max_norm.
+    // Returns the pre-clip norm (host scalar, synchronous).
+    float clip_grad_norm_(Qwen3Gradients* grads, float max_norm) {
+        if (!d_norm_acc_) CUDA_CHECK(cudaMalloc(&d_norm_acc_, sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_norm_acc_, 0, sizeof(float)));
+
+        const int block = 256;
+        const int max_grid = 2048;  // cap to avoid too many blocks for large vocab
+
+        int n16 = (int)(grads->half_pool_bytes  / sizeof(half));
+        int n32 = (int)(grads->float_pool_bytes / sizeof(float));
+
+        int grid16 = std::min(max_grid, (n16 + block - 1) / block);
+        int grid32 = std::min(max_grid, (n32 + block - 1) / block);
+
+        if (n16 > 0) sum_sq_half_kernel <<<grid16, block>>>(grads->half_pool,  d_norm_acc_, n16);
+        if (n32 > 0) sum_sq_float_kernel<<<grid32, block>>>(grads->float_pool, d_norm_acc_, n32);
+
+        float sum_sq;
+        CUDA_CHECK(cudaMemcpy(&sum_sq, d_norm_acc_, sizeof(float), cudaMemcpyDeviceToHost));
+        float total_norm = sqrtf(sum_sq);
+
+        if (total_norm > max_norm) {
+            float scale = max_norm / (total_norm + 1e-6f);
+            int g16 = (n16 + block - 1) / block;
+            int g32 = (n32 + block - 1) / block;
+            if (n16 > 0) scale_half_kernel <<<g16, block>>>(grads->half_pool,  scale, n16);
+            if (n32 > 0) scale_float_kernel<<<g32, block>>>(grads->float_pool, scale, n32);
+        }
+
+        return total_norm;
     }
 
 private:
@@ -272,6 +369,7 @@ private:
         if (d_log_probs_) { cudaFree(d_log_probs_); d_log_probs_ = nullptr; }
         if (d_loss_grad_) { cudaFree(d_loss_grad_); d_loss_grad_ = nullptr; }
         if (d_loss_mask_) { cudaFree(d_loss_mask_); d_loss_mask_ = nullptr; }
+        if (d_norm_acc_)  { cudaFree(d_norm_acc_);  d_norm_acc_  = nullptr; }
         buf_B_ = buf_S_ = 0;
     }
 };

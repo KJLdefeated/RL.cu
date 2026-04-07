@@ -47,6 +47,8 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [x] Scheduler (schedule input request)
 - [x] LLM Engine
 - [ ] Align with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
+  - [x] Prefill Kernel 6ms forward
+  - [ ] Decode Kernel Optimize
 
 ### Training
 - [x] Dataset loading
@@ -64,9 +66,9 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
   - Flat buffer pattern for contiguous memory access
 - [x] Implement learning rate scheduler (cosine with warmup)
 - [ ] Trainer
-  - [ ] Implement gradient accumulation across micro-batches
-  - [ ] Logging and training curve
-  - [ ] Build basic SFT training loop: load data → forward → loss → backward → step
+  - [x] Implement gradient accumulation across micro-batches
+  - [x] Logging and training curve
+  - [x] Build basic SFT training loop: load data → forward → loss → backward → step
   - [ ] Validate on tiny dataset: loss should decrease matching PyTorch
 - [ ] Successful SFT fine-tuning matching PyTorch training curves
 

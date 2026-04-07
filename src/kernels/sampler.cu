@@ -6,243 +6,117 @@
 #include <math.h>
 
 // =============================================================================
-// Sampler Kernel
+// Sampler Kernel v3 — Gumbel-max (nano-vllm style)
 // =============================================================================
 //
-// Grid:  (num_tokens,)        — one block per token
-// Block: (SAMPLER_BLOCK=256)  — each thread handles vocab_size/256 elements
+// Sampling method: Gumbel-max trick
 //
-// Dynamic shared memory layout (allocated by launch wrapper):
-//   s_topk_probs[top_k]:  float  top-k probabilities in descending order
-//   s_topk_ids  [top_k]:  int    corresponding vocab indices
-//   s_val       [256]:    float  per-thread scratch for block reductions (reused)
-//   s_idx       [256]:    int    per-thread scratch for argmax reduction
+//   argmax_i ( logit_i / T  +  Gumbel(0,1)_i )
 //
-// Total smem: top_k*8 + 256*8 bytes
-//   (top_k=50 → 2448 B; top_k=1024 → 10240 B — well within Blackwell's 164 KB)
+// This is mathematically equivalent to sampling from softmax(logits / T):
+//   P(token = i) = exp(logit_i / T) / sum_j exp(logit_j / T)
+// but implemented as a single argmax over perturbed logits — no softmax,
+// no CDF walk, no top-k selection.  Just one pass + one block reduction.
 //
-// Steps:
-//   1. temperature == 0  →  one-pass parallel argmax, write output, return.
-//   2. Softmax: scale logits by 1/T → find row max (block reduce) →
-//               compute exp(x-max) + sum (block reduce) → normalize.
-//              Result written to temp_probs workspace in global memory.
-//   3. Top-k: k rounds of cooperative argmax.  Each round all 256 threads
-//             scan their chunk, do a block-level max+idx reduction, thread 0
-//             records the winner in s_topk_{probs,ids} then zeros it in
-//             temp_probs so the next round finds the next-best value.
-//   4. Thread 0 (serial, short loop over top_k ≤ 1024):
-//              re-normalize top-k probs, walk cumulative sum for top-p nucleus,
-//              re-normalize nucleus, splitmix64 hash → uniform float → sample.
+// Gumbel noise: gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0,1)
+// Generated via a counter-based hash of (seed, tok_idx, vocab_idx).
+// Each call to __logf is the GPU intrinsic (~4–5 cycles), not the precise
+// libm logf (~20 cycles), so the two logf calls add ~10 cycles per element.
+//
+// Passes over vocab: 1 (v1: 53 passes; v2: 2 passes)
+// Shared memory: 64 bytes (v1/v2: up to 12 KB)
+// top_k / top_p: not used (nano-vllm also omits them)
+//
+// Grid:  (num_tokens,)       — one block per token
+// Block: (SAMPLER_BLOCK=256)
+//
+// Shared memory: 8 floats + 8 ints = 64 bytes for inter-warp reduction scratch
 // =============================================================================
 
 static constexpr int SAMPLER_BLOCK = 256;
 
-// ---------------------------------------------------------------------------
-// Block-level max+argmax reduction using dynamic shared memory arrays.
-// All threads write (val, idx) to s_val[tid]/s_idx[tid], then reduce in-place
-// to s_val[0]/s_idx[0].  Requires __syncthreads() before use of s_val[0].
-// ---------------------------------------------------------------------------
+// Counter-based per-element Gumbel(0,1) noise.
+// Mixes (seed, tok_idx, vocab_idx) via splitmix64-style finalizer → uniform
+// [0,1) → Gumbel sample.  Completely stateless and independent per element.
 __device__ __forceinline__
-void block_argmax(float& val, int& idx, float* s_val, int* s_idx, int tid)
+float gumbel_noise(unsigned long long seed, int tok, int idx)
 {
-    s_val[tid] = val;
-    s_idx[tid] = idx;
-    __syncthreads();
-    for (int s = SAMPLER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s && s_val[tid + s] > s_val[tid]) {
-            s_val[tid] = s_val[tid + s];
-            s_idx[tid] = s_idx[tid + s];
-        }
-        __syncthreads();
-    }
-    val = s_val[0];
-    idx = s_idx[0];
+    unsigned long long s = seed
+        ^ ((unsigned long long)tok  * 0x9e3779b97f4a7c15ULL)
+        ^ ((unsigned long long)(unsigned int)idx * 0x6c62272e07bb0142ULL);
+    s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
+    s ^= s >> 27; s *= 0x94d049bb133111ebULL;
+    s ^= s >> 31;
+    // Map to (0,1) — clamp away from 0 to avoid log(0)
+    float u = fmaxf((float)(s >> 11) * (1.0f / (float)(1ULL << 53)), 1e-37f);
+    // Gumbel(0,1): -log(-log(u))  [fast GPU intrinsic __logf ≈ 4–5 cycles]
+    return -__logf(-__logf(u));
 }
 
-// ---------------------------------------------------------------------------
-// Block-level max reduction using warp shuffles + shared memory.
-// s_val must have at least SAMPLER_BLOCK/32 = 8 elements.
-// Result broadcast to all threads via s_val[0].
-// ---------------------------------------------------------------------------
-__device__ __forceinline__
-void block_max(float& val, float* s_val, int tid)
-{
-    const int lane = tid & 31, warp = tid >> 5;
-    for (int off = 16; off > 0; off >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, off));
-    if (lane == 0) s_val[warp] = val;
-    __syncthreads();
-    if (warp == 0) {
-        val = (lane < SAMPLER_BLOCK / 32) ? s_val[lane] : -FLT_MAX;
-        for (int off = 16; off > 0; off >>= 1)
-            val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, off));
-        if (lane == 0) s_val[0] = val;
-    }
-    __syncthreads();
-    val = s_val[0];
-}
-
-// ---------------------------------------------------------------------------
-// Block-level sum reduction using warp shuffles + shared memory.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__
-void block_sum(float& val, float* s_val, int tid)
-{
-    const int lane = tid & 31, warp = tid >> 5;
-    for (int off = 16; off > 0; off >>= 1)
-        val += __shfl_xor_sync(0xffffffffu, val, off);
-    if (lane == 0) s_val[warp] = val;
-    __syncthreads();
-    if (warp == 0) {
-        val = (lane < SAMPLER_BLOCK / 32) ? s_val[lane] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1)
-            val += __shfl_xor_sync(0xffffffffu, val, off);
-        if (lane == 0) s_val[0] = val;
-    }
-    __syncthreads();
-    val = s_val[0];
-}
-
-// ---------------------------------------------------------------------------
-// Main kernel
-// ---------------------------------------------------------------------------
 __global__ void sampler_kernel(
     const half* __restrict__ logits,    // [num_tokens, vocab_size] FP16
-    float*      __restrict__ probs,     // [num_tokens, vocab_size] FP32 workspace
+    float*      __restrict__ /*probs*/, // unused — kept for API compat
     int         vocab_size,
-    int         top_k,                  // already clamped: [1, MAX_SAMPLER_TOP_K]
-    float       top_p,
-    float       temperature,            // 0 → greedy
+    int         /*top_k*/,              // unused — Gumbel-max samples full vocab
+    float       /*top_p*/,              // unused
+    float       temperature,            // 0 → greedy argmax
     unsigned long long seed,
     int64_t*    __restrict__ output_ids
 ) {
-    extern __shared__ char smem_raw[];
+    // Warp-reduction scratch: 8 floats + 8 ints (= 64 bytes, static allocation)
+    __shared__ float s_val[SAMPLER_BLOCK / 32];
+    __shared__ int   s_idx[SAMPLER_BLOCK / 32];
 
     const int tok_idx = blockIdx.x;
     const int tid     = threadIdx.x;
-
-    // Shared memory pointers from dynamic allocation
-    float* s_topk_probs = (float*)smem_raw;
-    int*   s_topk_ids   = (int*)  (smem_raw + (size_t)top_k * sizeof(float));
-    float* s_val        = (float*)(smem_raw + (size_t)top_k * (sizeof(float) + sizeof(int)));
-    int*   s_idx        = (int*)  (smem_raw + (size_t)top_k * (sizeof(float) + sizeof(int))
-                                            + (size_t)SAMPLER_BLOCK * sizeof(float));
+    const int lane    = tid & 31;
+    const int warp    = tid >> 5;
 
     const half* src = logits + (long)tok_idx * vocab_size;
-    float*      P   = probs  + (long)tok_idx * vocab_size;
 
     // -------------------------------------------------------------------------
-    // Fast path: temperature == 0 → greedy argmax (no softmax, no sampling)
+    // Single pass: find argmax of (scaled_logit + noise)
+    //   temperature == 0 → greedy: noise = 0
+    //   temperature >  0 → Gumbel-max: noise = Gumbel(0,1) per element
     // -------------------------------------------------------------------------
+    float best_val = -FLT_MAX;
+    int   best_idx = 0;
+
     if (temperature == 0.0f) {
-        float lv = -FLT_MAX;
-        int   li = 0;
+        // Greedy: pure argmax over logits (no random noise)
         for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK) {
             float v = __half2float(src[i]);
-            if (v > lv) { lv = v; li = i; }
+            if (v > best_val) { best_val = v; best_idx = i; }
         }
-        block_argmax(lv, li, s_val, s_idx, tid);
-        if (tid == 0) output_ids[tok_idx] = (int64_t)li;
-        return;
+    } else {
+        const float inv_temp = 1.0f / temperature;
+        for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK) {
+            float score = __half2float(src[i]) * inv_temp
+                        + gumbel_noise(seed, tok_idx, i);
+            if (score > best_val) { best_val = score; best_idx = i; }
+        }
     }
 
     // -------------------------------------------------------------------------
-    // Step 1: Temperature scaling + numerically stable softmax
-    //         Write float probabilities to probs workspace.
+    // Block-level argmax reduction: warp shuffles → shared memory → warp 0
     // -------------------------------------------------------------------------
-    const float inv_temp = 1.0f / temperature;
-
-    // Pass 1: scale by temperature and find row max
-    float local_max = -FLT_MAX;
-    for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK) {
-        float v = __half2float(src[i]) * inv_temp;
-        P[i] = v;
-        if (v > local_max) local_max = v;
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, best_val, off);
+        int   oi = __shfl_xor_sync(0xffffffffu, best_idx, off);
+        if (ov > best_val) { best_val = ov; best_idx = oi; }
     }
-    block_max(local_max, s_val, tid);
-    const float row_max = local_max;
-
-    // Pass 2: exp(x - max) and accumulate sum
-    float local_sum = 0.0f;
-    for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK) {
-        float p = expf(P[i] - row_max);
-        P[i] = p;
-        local_sum += p;
-    }
-    block_sum(local_sum, s_val, tid);
-    const float inv_sum = 1.0f / local_sum;
-
-    // Pass 3: normalize
-    for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK)
-        P[i] *= inv_sum;
+    if (lane == 0) { s_val[warp] = best_val; s_idx[warp] = best_idx; }
     __syncthreads();
 
-    // -------------------------------------------------------------------------
-    // Step 2: Top-k selection via k rounds of cooperative parallel argmax.
-    //
-    // Each round: all threads scan their chunk → block_argmax → thread 0
-    // records winner in s_topk_{probs,ids} and zeros P[winner] so the next
-    // round finds the next-best token.  After k rounds, s_topk_probs[0..k-1]
-    // holds the top-k probabilities in strictly descending order.
-    // -------------------------------------------------------------------------
-    for (int r = 0; r < top_k; r++) {
-        float lv = -FLT_MAX;
-        int   li = 0;
-        for (int i = tid; i < vocab_size; i += SAMPLER_BLOCK) {
-            if (P[i] > lv) { lv = P[i]; li = i; }
+    if (warp == 0) {
+        best_val = (lane < SAMPLER_BLOCK / 32) ? s_val[lane] : -FLT_MAX;
+        best_idx = (lane < SAMPLER_BLOCK / 32) ? s_idx[lane] : 0;
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, best_val, off);
+            int   oi = __shfl_xor_sync(0xffffffffu, best_idx, off);
+            if (ov > best_val) { best_val = ov; best_idx = oi; }
         }
-        block_argmax(lv, li, s_val, s_idx, tid);
-        if (tid == 0) {
-            s_topk_probs[r] = lv;
-            s_topk_ids  [r] = li;
-            P[li] = 0.0f;   // remove this token so next round finds next-best
-        }
-        __syncthreads();
-    }
-
-    // -------------------------------------------------------------------------
-    // Step 3: Top-p nucleus truncation + weighted sample (thread 0, serial)
-    //
-    // The top-k candidates are already in descending probability order.
-    // Re-normalize within top-k, walk cumulative sum to find the nucleus,
-    // then sample proportionally from the nucleus using splitmix64 PRNG.
-    // -------------------------------------------------------------------------
-    if (tid == 0) {
-        // Re-normalize top-k probs (sum < 1 since remaining mass was zeroed)
-        float topk_sum = 0.0f;
-        for (int i = 0; i < top_k; i++) topk_sum += s_topk_probs[i];
-        const float inv_tk = 1.0f / topk_sum;
-
-        // Find nucleus size for top-p (already in descending order)
-        int nucleus = top_k;
-        if (top_p < 1.0f) {
-            float cum = 0.0f;
-            for (int i = 0; i < top_k; i++) {
-                cum += s_topk_probs[i] * inv_tk;
-                if (cum >= top_p) { nucleus = i + 1; break; }
-            }
-        }
-
-        // Re-normalize within nucleus
-        float nuc_sum = 0.0f;
-        for (int i = 0; i < nucleus; i++) nuc_sum += s_topk_probs[i];
-        const float inv_nuc = 1.0f / nuc_sum;
-
-        // splitmix64: high-quality integer hash → uniform float in [0, 1)
-        unsigned long long s = seed + (unsigned long long)tok_idx * 0x9e3779b97f4a7c15ULL;
-        s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ULL;
-        s ^= s >> 27; s *= 0x94d049bb133111ebULL;
-        s ^= s >> 31;
-        const float r = (float)(s >> 11) * (1.0f / (float)(1ULL << 53));
-
-        // Walk cumulative distribution and sample
-        float cum = 0.0f;
-        int sampled = s_topk_ids[0];
-        for (int i = 0; i < nucleus; i++) {
-            cum += s_topk_probs[i] * inv_nuc;
-            if (r <= cum) { sampled = s_topk_ids[i]; break; }
-        }
-        output_ids[tok_idx] = (int64_t)sampled;
+        if (lane == 0) output_ids[tok_idx] = (int64_t)best_idx;
     }
 }
 
@@ -252,25 +126,21 @@ __global__ void sampler_kernel(
 
 void launch_sampler(
     const half*        logits,
-    float*             temp_probs,
+    float*             temp_probs,   // unused in v3; kept for API compatibility
     int                num_tokens,
     int                vocab_size,
-    int                top_k,
-    float              top_p,
+    int                top_k,        // ignored
+    float              top_p,        // ignored
     float              temperature,
     unsigned long long seed,
     int64_t*           output_ids,
     cudaStream_t       stream
 ) {
-    // Clamp top_k to valid range
-    if (top_k <= 0 || top_k > MAX_SAMPLER_TOP_K) top_k = MAX_SAMPLER_TOP_K;
-    if (top_k > vocab_size)                       top_k = vocab_size;
+    (void)temp_probs; (void)top_k; (void)top_p; (void)vocab_size;
+    if (num_tokens == 0) return;
 
-    // Dynamic shared memory: top_k*(float+int) + BLOCK*(float+int)
-    const size_t smem = (size_t)top_k   * (sizeof(float) + sizeof(int))
-                      + (size_t)SAMPLER_BLOCK * (sizeof(float) + sizeof(int));
-
-    sampler_kernel<<<num_tokens, SAMPLER_BLOCK, smem, stream>>>(
+    // 64 bytes static smem declared inside kernel; dynamic smem = 0
+    sampler_kernel<<<num_tokens, SAMPLER_BLOCK, 0, stream>>>(
         logits, temp_probs, vocab_size,
         top_k, top_p, temperature, seed, output_ids
     );

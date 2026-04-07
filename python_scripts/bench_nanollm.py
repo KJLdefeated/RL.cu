@@ -48,7 +48,7 @@ def main() -> None:
         for _ in range(NUM_SEQS)
     ]
     sampling_params = [
-        SamplingParams(temperature=0.6, top_k=50, ignore_eos=True,
+        SamplingParams(temperature=0.6, ignore_eos=True,
                        max_tokens=randint(100, MAX_OUT_LEN))
         for _ in range(NUM_SEQS)
     ]
@@ -64,7 +64,7 @@ def main() -> None:
 
     # Warmup
     print("[warmup] ...")
-    llm.generate([[1]], [SamplingParams(temperature=0.6, top_k=50, max_tokens=4)])
+    llm.generate([[1]], [SamplingParams(temperature=0.6, max_tokens=4)])
 
     # Timed run
     print("[bench ] running ...")

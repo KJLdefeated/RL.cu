@@ -29,7 +29,9 @@ public:
         // and ModelRunner agree on the batch slot limit. Without this, the
         // Scheduler assigns batch_slots up to the original max_num_seqs while
         // ModelRunner only allocated KV/sampler buffers for the budget-limited value.
-        config.max_num_seqs = model_runner->config.max_num_seqs;
+        config.max_num_seqs           = model_runner->config.max_num_seqs;
+        config.num_kv_blocks          = model_runner->config.num_kv_blocks;
+        config.max_num_batched_tokens = model_runner->config.max_num_batched_tokens;
         scheduler    = new Scheduler(config);
     }
     ~LLMEngine() {
@@ -48,33 +50,53 @@ public:
     }
 
     // Returns ({(seq_id, completion_token_ids), ...}, total_new_tokens)
+    //
+    // Two-phase continuous batching:
+    //   Phase 1 — decode all currently running sequences.
+    //             Sequences that finish free their batch slots.
+    //   Phase 2 — prefill waiting sequences into the newly vacated slots.
+    //             Those sequences will be decoded starting from the next step().
+    //
+    // This keeps the decode batch at max capacity: as soon as a slot opens up
+    // a new sequence fills it in the same call, so the next decode step is full.
     std::pair<std::vector<std::pair<int64_t, std::vector<int64_t>>>, int> step() {
-        auto [batch, is_prefill] = scheduler->schedule();
-        if (batch.empty()) return {{}, 0};
+        std::vector<std::pair<int64_t, std::vector<int64_t>>> output;
+        int num_tokens = 0;
 
-        // Free model KV state for sequences preempted during scheduling.
+        // Helper: collect finished sequences, free their KV/slot, accumulate output.
+        auto collect_finished = [&](std::vector<Sequence*>& batch) {
+            for (Sequence* seq : batch) {
+                if (seq->status == SeqStatus::FINISHED) {
+                    model_runner->free_seq_slot(seq->batch_slot);
+                    std::vector<int64_t> completion = seq->completion_token_ids();
+                    num_tokens += (int)completion.size();
+                    output.push_back({seq->seq_id, std::move(completion)});
+                    delete seq;
+                }
+            }
+        };
+
+        // ── Phase 1: decode ──────────────────────────────────────────────────────
+        auto decode_batch = scheduler->schedule_decode();
+
+        // Free KV state for any sequences preempted while building the decode batch.
         for (int slot : scheduler->preempted_slots())
             model_runner->free_seq_slot(slot);
 
-        std::vector<int64_t> new_token_ids = model_runner->run(batch, is_prefill);
-        scheduler->postprocess(batch, new_token_ids, is_prefill);
-
-        // Free model KV state for finished sequences.
-        for (int b = 0; b < (int)batch.size(); b++) {
-            if (batch[b]->status == SeqStatus::FINISHED)
-                model_runner->free_seq_slot(batch[b]->batch_slot);
+        if (!decode_batch.empty()) {
+            auto toks = model_runner->run(decode_batch, /*is_prefill=*/false);
+            scheduler->postprocess(decode_batch, toks, /*is_prefill=*/false);
+            collect_finished(decode_batch);
         }
 
-        std::vector<std::pair<int64_t, std::vector<int64_t>>> output;
-        int num_tokens = 0;
-        for (Sequence* seq : batch) {
-            if (seq->status == SeqStatus::FINISHED) {
-                std::vector<int64_t> completion = seq->completion_token_ids();
-                num_tokens += (int)completion.size();
-                output.push_back({seq->seq_id, std::move(completion)});
-                delete seq;  // seq was heap-allocated in add_request
-            }
+        // ── Phase 2: prefill into vacated slots ──────────────────────────────────
+        auto prefill_batch = scheduler->schedule_prefill();
+        if (!prefill_batch.empty()) {
+            auto toks = model_runner->run(prefill_batch, /*is_prefill=*/true);
+            scheduler->postprocess(prefill_batch, toks, /*is_prefill=*/true);
+            collect_finished(prefill_batch);
         }
+
         return {output, num_tokens};
     }
 

@@ -101,6 +101,28 @@ static std::set<int> cpu_top_k_set_threshold(const half* logits,
     return s;
 }
 
+// Threshold-based top-k set using FP32 SOFTMAX PROBABILITIES as the criterion.
+// Necessary because two tokens with different FP16 logits can produce equal
+// FP32 probability after exp(), so logit-based threshold ≠ probability-based
+// threshold at the boundary.  This matches exactly what the GPU kernel does.
+static std::set<int> cpu_topk_prob_threshold(const half* logits,
+                                              int vocab_size, int k,
+                                              float temperature) {
+    std::vector<float> probs(vocab_size);
+    cpu_softmax(probs.data(), logits, temperature, vocab_size);
+
+    std::vector<float> sorted_probs = probs;
+    int n = std::min(k, vocab_size);
+    std::nth_element(sorted_probs.begin(), sorted_probs.begin() + n - 1,
+                     sorted_probs.end(), std::greater<float>());
+    float threshold = sorted_probs[n - 1];
+
+    std::set<int> s;
+    for (int i = 0; i < vocab_size; i++)
+        if (probs[i] >= threshold) s.insert(i);
+    return s;
+}
+
 // Top-p nucleus set matching GPU semantics:
 //   1. softmax, 2. top-k mask + renormalize, 3. walk cumsum until >= top_p.
 // top_k: clamp before calling (consistent with launch_sampler wrapper).
@@ -435,61 +457,28 @@ int main() {
     bool all_pass = true;
 
     // ── Greedy (temperature=0) ────────────────────────────────────────────────
-    printf("--- Greedy (temperature=0, value-equality) ---\n");
-    all_pass &= test_greedy("Greedy V=100  temp=0",    100,   0.0f, 1,  0ULL);
-    all_pass &= test_greedy("Greedy V=1024 temp=0",    1024,  0.0f, 1,  1ULL);
-    all_pass &= test_greedy("Greedy V=32000 temp=0",   32000, 0.0f, 1,  2ULL);
-    all_pass &= test_greedy("Top-k=1 V=200 temp=1.0",  200,   1.0f, 1,  3ULL);
-    all_pass &= test_greedy("Top-k=1 V=1024 temp=0.5", 1024,  0.5f, 1,  4ULL);
+    printf("--- Greedy (temperature=0) ---\n");
+    all_pass &= test_greedy("Greedy V=100  temp=0",   100,   0.0f, 1, 0ULL);
+    all_pass &= test_greedy("Greedy V=1024 temp=0",   1024,  0.0f, 1, 1ULL);
+    all_pass &= test_greedy("Greedy V=32000 temp=0",  32000, 0.0f, 1, 2ULL);
+    all_pass &= test_greedy("Greedy V=151936 temp=0", 151936,0.0f, 1, 3ULL);
 
-    // ── Top-k validity ────────────────────────────────────────────────────────
-    printf("\n--- Top-k validity (threshold-based, handles FP16 ties) ---\n");
-    all_pass &= test_topk_validity(
-        "top-k=10  V=100   T=1.0  N=5000",   100,   10, 1.0f, 5000);
-    all_pass &= test_topk_validity(
-        "top-k=50  V=1000  T=1.0  N=5000",   1000,  50, 1.0f, 5000);
-    all_pass &= test_topk_validity(
-        "top-k=50  V=1000  T=0.7  N=5000",   1000,  50, 0.7f, 5000);
-    all_pass &= test_topk_validity(
-        "top-k=100 V=32000 T=1.0  N=2000",   32000, 100, 1.0f, 2000);
-    all_pass &= test_topk_validity(
-        "top-k=50  V=151936 T=1.0 N=500",    151936, 50, 1.0f, 500);
-
-    // ── Top-p validity ────────────────────────────────────────────────────────
-    printf("\n--- Top-p validity (GPU semantics: renormalize within top-k first) ---\n");
-    all_pass &= test_topp_validity(
-        "top-p=0.9  V=100  T=1.0  N=5000",   100,  1.0f, 0.9f,  0, 5000);
-    all_pass &= test_topp_validity(
-        "top-p=0.95 V=1000 T=1.0  N=5000",   1000, 1.0f, 0.95f, 0, 5000);
-    all_pass &= test_topp_validity(
-        "top-p=0.8  V=1000 T=0.7  N=3000",   1000, 0.7f, 0.8f,  0, 3000);
-    // Note: combined top-k + top-p at V=151936 is omitted here because random
-    // FP16 logits in [-1.5,1.5] produce ~84 tied tokens at the top-50 boundary
-    // (~1 in 3 tie rate with FP16 in that range). The GPU selects exactly 50
-    // via iterative argmax; the CPU nucleus built from all 84 tied tokens
-    // diverges non-trivially. top-k validity at V=151936 is covered above;
-    // top-p correctness is validated on the V=1000 cases below.
-    all_pass &= test_topp_validity(
-        "top-k=50 top-p=1.0 V=151936 T=1.0 N=200",
-        151936, 1.0f, 1.0f, 50, 200);
-
-    // ── Distribution accuracy ─────────────────────────────────────────────────
-    printf("\n--- Distribution accuracy (KL divergence vs theoretical) ---\n");
+    // ── Distribution accuracy (Gumbel-max ≡ sampling from softmax(logits/T)) ─
+    // Gumbel-max samples token i with probability softmax(logits/T)[i], so the
+    // empirical frequency over N draws should match the theoretical softmax.
+    // The reference distribution is the FULL softmax (no top-k/top-p masking).
+    printf("\n--- Distribution accuracy (KL vs softmax, Gumbel-max) ---\n");
     all_pass &= test_distribution(
-        "V=20  top-k=10 top-p=1.0 T=1.0  N=50000",
-        20, 10, 1.0f, 1.0f, 50000, 0.05f);
+        "V=20  T=1.0  N=50000",  20,  151936/*ignored*/, 1.0f, 1.0f, 50000, 0.05f);
     all_pass &= test_distribution(
-        "V=50  top-k=20 top-p=0.9 T=1.0  N=50000",
-        50, 20, 0.9f, 1.0f, 50000, 0.05f);
+        "V=50  T=1.0  N=50000",  50,  151936,            1.0f, 1.0f, 50000, 0.05f);
     all_pass &= test_distribution(
-        "V=100 top-k=30 top-p=1.0 T=0.5  N=50000",
-        100, 30, 1.0f, 0.5f, 50000, 0.05f);
+        "V=100 T=0.5  N=50000",  100, 151936,            1.0f, 0.5f, 50000, 0.05f);
     all_pass &= test_distribution(
-        "V=100 top-k=50 top-p=0.85 T=0.8 N=50000",
-        100, 50, 0.85f, 0.8f, 50000, 0.05f);
+        "V=100 T=0.8  N=50000",  100, 151936,            1.0f, 0.8f, 50000, 0.05f);
 
     // ── Batched greedy ────────────────────────────────────────────────────────
-    printf("\n--- Batched greedy (B distinct rows, value-equality) ---\n");
+    printf("\n--- Batched greedy (B distinct rows) ---\n");
     all_pass &= test_batched_greedy(8,   1024);
     all_pass &= test_batched_greedy(16,  32000);
     all_pass &= test_batched_greedy(4,   151936);
@@ -499,11 +488,11 @@ int main() {
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     printf("\n=== Benchmarks (warmup=5, iters=100) ===\n");
-    run_benchmark("Greedy   B=1  V=151936",   1, 151936,  1, 0.0f);
-    run_benchmark("top-k=1  B=1  V=151936",   1, 151936,  1, 1.0f);
-    run_benchmark("top-k=50 B=1  V=151936",   1, 151936, 50, 1.0f);
-    run_benchmark("top-k=50 B=4  V=151936",   4, 151936, 50, 1.0f);
-    run_benchmark("top-k=50 B=16 V=151936",  16, 151936, 50, 1.0f);
+    run_benchmark("Greedy   B=1  V=151936",   1, 151936, 0, 0.0f);
+    run_benchmark("Gumbel   B=1  V=151936",   1, 151936, 0, 1.0f);
+    run_benchmark("Gumbel   B=4  V=151936",   4, 151936, 0, 1.0f);
+    run_benchmark("Gumbel   B=16 V=151936",  16, 151936, 0, 1.0f);
+    run_benchmark("Gumbel   B=64 V=151936",  64, 151936, 0, 1.0f);
 
     return all_pass ? 0 : 1;
 }

@@ -16,9 +16,10 @@ class ModelRunner {
     Qwen3Config        model_config;
     int                block_size;
     bool               enforce_eager;
-    float*             d_temp_probs = nullptr;  // [max_num_seqs, vocab_size] FP32 sampler workspace
-    int64_t*           d_output_ids = nullptr;  // [max_num_seqs] sampled token IDs
-    unsigned long long sample_seed  = 42ULL;    // PRNG seed, incremented each step
+    float*             d_temp_probs  = nullptr;  // [max_num_seqs, vocab_size] FP32 sampler workspace
+    int64_t*           d_output_ids  = nullptr;  // [max_num_seqs] sampled token IDs
+    void*              d_cublas_ws   = nullptr;  // pre-allocated cuBLAS workspace (32 MB)
+    unsigned long long sample_seed   = 42ULL;    // PRNG seed, incremented each step
 
     ModelRunner(const Config& cfg) : config(cfg) {
         model_config = load_config(cfg.model);
@@ -29,7 +30,7 @@ class ModelRunner {
         // Compute KV cache budget and adjust max_num_seqs
         compute_kv_budget(config, model_config, model->weights.total_bytes);
         // Initialize model with max batch/seq for buffer allocation.
-        qwen3_init(model, config.max_num_seqs, cfg.max_model_len, cfg.max_num_batched_tokens, config.num_kv_blocks);
+        qwen3_init(model, config.max_num_seqs, config.max_model_len, config.max_num_batched_tokens, config.num_kv_blocks);
         block_size    = cfg.kv_block_size;
         enforce_eager = cfg.enforce_eager;
 
@@ -37,6 +38,16 @@ class ModelRunner {
         int V = model_config.vocab_size;
         CUDA_CHECK(cudaMalloc(&d_temp_probs, (long)config.max_num_seqs * V * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_output_ids, config.max_num_seqs * sizeof(int64_t)));
+
+        // Pre-allocate cuBLAS workspace so cuBLAS never tries to allocate from the
+        // async memory pool during warmup or inference.  With a large KV cache (e.g.
+        // 80+ GB), the async pool can be exhausted, causing cublasGemmEx → status=14.
+        // 32 MB covers all GEMM shapes in Qwen3 (max: T×3072×1024 with T≤max_tokens).
+        CUDA_CHECK(cudaMalloc(&d_cublas_ws, 32ULL * 1024 * 1024));
+        CUBLAS_CHECK(cublasSetWorkspace(model->cublas, d_cublas_ws, 32ULL * 1024 * 1024));
+        // Flush any pending CUDA errors before warmup so they don't pollute cuBLAS.
+        CUDA_CHECK(cudaDeviceSynchronize());
+
         printf("[Qwen3] Loaded: %d layers  H_q=%d H_kv=%d  hidden=%d  vocab=%d\n",
            model_config.num_hidden_layers, model_config.num_attention_heads,
            model_config.num_key_value_heads, model_config.hidden_size, model_config.vocab_size);
@@ -59,8 +70,10 @@ class ModelRunner {
             cudaFree(gs.g_slot_map);
             cudaFree(gs.g_block_tables);
             cudaFree(gs.g_seq_lens);
-            cudaFree(gs.g_cublas_ws);
+            // d_cublas_ws is freed below (it's the same d_cublas_ws pre-allocated
+            // in the constructor; capture_cudagraph no longer allocates its own).
         }
+        cudaFree(d_cublas_ws);   // free once, unconditionally
         cudaFree(d_temp_probs);
         cudaFree(d_output_ids);
         // Free weights, KV cache, scratch buffers, cuBLAS, host mirrors.
@@ -98,9 +111,10 @@ class ModelRunner {
         int B = (int)batch.size();
         int V = model_config.vocab_size;
 
+        CUDAGraphState& gs = model->graph_state;
         half* d_logits = is_prefill
             ? qwen3_prefill(model, batch, stream)
-            : qwen3_decode(model, batch, stream);
+            : qwen3_decode(model, batch, stream);  // TODO: re-enable graph path after debugging
 
         const SamplingParams& sp = batch[0]->sampling_params;
         launch_sampler(
@@ -126,7 +140,7 @@ class ModelRunner {
 
         CUDAGraphState& gs = model->graph_state;
         const Qwen3Config& c = model->config;
-        int max_bucket = std::min(model->max_batch, 128);
+        int max_bucket = std::min(model->max_batch, 256);
         int mbps = model->kv_cache.max_blocks_per_seq;
 
         // Allocate graph capture buffers
@@ -142,17 +156,21 @@ class ModelRunner {
         CUDA_CHECK(cudaMemset(gs.g_block_tables, 0, max_bucket * mbps * sizeof(int)));
         CUDA_CHECK(cudaMemset(gs.g_seq_lens,     0, max_bucket * sizeof(int)));
 
-        gs.buckets = {1, 2, 4, 8};
-        for (int b = 16; b <= max_bucket; b += 16)
+        gs.buckets.clear();
+        for (int b : {1, 2, 4, 8}) {
+            if (b <= max_bucket) gs.buckets.push_back(b);
+        }
+        for (int b = 16; b < max_bucket; b += 16)
             gs.buckets.push_back(b);
+        if (gs.buckets.empty() || gs.buckets.back() != max_bucket)
+            gs.buckets.push_back(max_bucket);  // always cover the actual max batch
 
         CUBLAS_CHECK(cublasSetStream(model->cublas, stream));
 
-        // Pre-allocate cuBLAS workspace so it doesn't try to allocate during capture.
-        void* d_cublas_ws = nullptr;
-        const size_t cublas_ws_bytes = 32ULL * 1024 * 1024;  // 32 MB
-        CUDA_CHECK(cudaMalloc(&d_cublas_ws, cublas_ws_bytes));
-        CUBLAS_CHECK(cublasSetWorkspace(model->cublas, d_cublas_ws, cublas_ws_bytes));
+        // Workspace is pre-allocated by the constructor (d_cublas_ws) and already
+        // set on the handle.  Re-set it here after switching to the capture stream
+        // so the workspace association follows the handle's current stream.
+        CUBLAS_CHECK(cublasSetWorkspace(model->cublas, d_cublas_ws, 32ULL * 1024 * 1024));
 
         for (int i = gs.buckets.size() - 1; i >= 0; i--) {
             int B = gs.buckets[i];
@@ -170,6 +188,19 @@ class ModelRunner {
             // capture
             cudaGraph_t graph;
             CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            // D2D: update model buffers from graph's fixed "parameter" buffers.
+            // These D2D copies MUST be inside the capture so they re-execute on
+            // every graph launch (the H2D into gs.g_* happens outside the graph,
+            // but the model-internal buffers that layer kernels read from are
+            // updated here inside the graph).
+            CUDA_CHECK(cudaMemcpyAsync(model->d_pos_ids, gs.g_pos_ids,
+                                       B * sizeof(int), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(model->d_slot_map, gs.g_slot_map,
+                                       B * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(model->kv_cache.block_tables, gs.g_block_tables,
+                                       (long)B * mbps * sizeof(int), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(model->kv_cache.seq_lens, gs.g_seq_lens,
+                                       B * sizeof(int), cudaMemcpyDeviceToDevice, stream));
             launch_embedding(model->d_hidden, model->weights.embed_tokens, gs.g_token_ids, B, c.vocab_size, c.hidden_size, stream);
             for (int l = 0; l < c.num_hidden_layers; l++)
                 qwen3_layer_forward(model, l, B, B, 1, false, stream);
@@ -182,10 +213,6 @@ class ModelRunner {
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         gs.captured = true;
-        // Keep d_cublas_ws alive — the captured graph nodes reference it.
-        // Free it only when the graphs are destroyed (in ~ModelRunner).
-        gs.g_cublas_ws = d_cublas_ws;
-        // Restore default stream for eager-mode (prefill) cuBLAS calls.
         CUBLAS_CHECK(cublasSetStream(model->cublas, 0));
         CUDA_CHECK(cudaStreamDestroy(stream));
         printf("[CUDA_GRAPH] Captured %zu decode graphs (buckets 1..%d)\n", gs.buckets.size(), max_bucket);
@@ -200,45 +227,60 @@ class ModelRunner {
         size_t free, total;
         cudaMemGetInfo(&free, &total);
 
-        // Bytes per KV block: 2 (K+V) × layers × block_size × kv_heads × head_dim × sizeof(half)
         size_t block_bytes = 2ULL
-            * model_cfg.num_hidden_layers
-            * cfg.kv_block_size
-            * model_cfg.num_key_value_heads
-            * model_cfg.head_dim
-            * sizeof(half);
+            * model_cfg.num_hidden_layers * cfg.kv_block_size
+            * model_cfg.num_key_value_heads * model_cfg.head_dim * sizeof(half);
 
-        // Budget for activation scratch (estimate from max batch forward)
-        // Dominant term: ffn intermediates = max_tokens × intermediate_size × 2
-        size_t max_tokens = cfg.max_num_batched_tokens;
-        size_t activation_bytes = max_tokens * (
-            3ULL * model_cfg.hidden_size     // hidden + residual + normed
-            + model_cfg.q_dim                // Q
-            + 2ULL * model_cfg.kv_dim        // K + V
-            + model_cfg.q_dim               // attn_out
+        size_t per_token_act = (
+            3ULL * model_cfg.hidden_size      // hidden + residual + normed
+            + model_cfg.q_dim                 // Q
+            + 2ULL * model_cfg.kv_dim         // K + V
+            + model_cfg.q_dim                 // attn_out
             + 3ULL * model_cfg.intermediate_size  // gate + up + ffn_inter
         ) * sizeof(half);
 
-        // Reserve some headroom for cuBLAS workspace, CUDA context, etc.
-        size_t reserved = 256ULL * 1024 * 1024;  // 256 MB safety margin
+        size_t reserved     = 256ULL * 1024 * 1024;
+        // Use `free` (not `total`) so we respect other processes already occupying
+        // GPU memory.  `free` is measured after weights are loaded, so weight_bytes
+        // are already excluded — no separate subtraction needed.
+        if (free < reserved) free = reserved;  // safety: avoid underflow
+        size_t total_budget = (size_t)(free * cfg.gpu_memory_utilization) - reserved;
+        (void)weight_bytes;  // no longer needed; kept in signature for documentation
 
-        size_t budget = (size_t)(total * cfg.gpu_memory_utilization)
-                    - weight_bytes
-                    - activation_bytes
-                    - reserved;
-
-        cfg.num_kv_blocks = budget / block_bytes;
-
-        // Sanity checks
         int min_blocks_per_seq = (cfg.max_model_len + cfg.kv_block_size - 1)
-                            / cfg.kv_block_size;
-        int max_seqs_by_memory = cfg.num_kv_blocks / min_blocks_per_seq;
-        cfg.max_num_seqs = std::min(cfg.max_num_seqs, max_seqs_by_memory);
+                               / cfg.kv_block_size;
 
-        printf("[ENGINE] GPU: %.1f GB total, %.1f GB for KV cache\n",
-            total / 1e9, (cfg.num_kv_blocks * block_bytes) / 1e9);
+        // Iterative solver: scratch = est_max_seqs × max_model_len tokens (the actual
+        // ceiling — we never process more tokens than that in one forward pass), capped
+        // at the user's max_num_batched_tokens.  Iterate until max_num_seqs stabilises.
+        int est = cfg.max_num_seqs;
+        for (int iter = 0; iter < 10; iter++) {
+            size_t scratch_tokens = std::min(
+                (size_t)est * (size_t)cfg.max_model_len,
+                (size_t)cfg.max_num_batched_tokens);
+            size_t act_bytes = scratch_tokens * per_token_act;
+            if (act_bytes >= total_budget) { est = 1; break; }
+
+            int kv_blocks  = (int)((total_budget - act_bytes) / block_bytes);
+            int new_est    = std::min(kv_blocks / min_blocks_per_seq, cfg.max_num_seqs);
+            if (std::abs(new_est - est) <= 1) { est = std::min(new_est, est); break; }
+            est = new_est;
+        }
+        cfg.max_num_seqs = est;
+
+        // Recompute final values with converged max_num_seqs.
+        size_t scratch_tokens = std::min(
+            (size_t)cfg.max_num_seqs * (size_t)cfg.max_model_len,
+            (size_t)cfg.max_num_batched_tokens);
+        cfg.num_kv_blocks = (int)((total_budget - scratch_tokens * per_token_act) / block_bytes);
+
+        // Update max_num_batched_tokens so qwen3_init allocates the right-sized scratch
+        // buffers.  Keeping it at 262 K would re-waste the 4-8 GB we freed for KV blocks.
+        cfg.max_num_batched_tokens = (int)scratch_tokens;
+
+        printf("[ENGINE] GPU: %.1f GB total  %.1f GB free after weights, %.1f GB for KV cache\n",
+            total / 1e9, free / 1e9, (cfg.num_kv_blocks * block_bytes) / 1e9);
         printf("[ENGINE] %d KV blocks (block_size=%d) → supports %d seqs × %d len\n",
-            cfg.num_kv_blocks, cfg.kv_block_size,
-            cfg.max_num_seqs, cfg.max_model_len);
+            cfg.num_kv_blocks, cfg.kv_block_size, cfg.max_num_seqs, cfg.max_model_len);
     }
 };

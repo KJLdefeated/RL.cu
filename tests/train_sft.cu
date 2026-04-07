@@ -113,7 +113,8 @@ int main(int argc, char** argv) {
            schedule == LRScheduleType::Cosine ? "cosine" : "constant",
            base_lr, min_lr, warmup_steps, total_steps);
     printf("  save_dir    : %s\n",  save_dir.c_str());
-    printf("  log / save  : every %d / %d steps\n\n", log_steps, save_steps);
+    printf("  log / save  : every %d / %d steps\n",   log_steps, save_steps);
+    printf("  freeze_embed: yes (tied embed_tokens)\n\n");
 
     // ── Load model ────────────────────────────────────────────────────────────
     // qwen3_load allocates KV scratch for max_batch sequences; use micro-batch
@@ -141,6 +142,10 @@ int main(int argc, char** argv) {
         /*save_total_limit=*/5,
         schedule
     );
+    // Qwen3-0.6B uses tied embeddings (embed_tokens == lm_head).
+    // Freezing prevents the embedding table from drifting during SFT,
+    // which would corrupt token representations shared with the output head.
+    config.freeze_embed = true;
 
     // ── Run training ─────────────────────────────────────────────────────────
     SFTTrainer trainer(config, model);

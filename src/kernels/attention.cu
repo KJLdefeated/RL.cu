@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <mma.h>
+#include <cstdio>
 
 using namespace nvcuda;
 
@@ -145,6 +146,19 @@ __global__ void flash_attention_prefill_kernel(
     auto Ps  = [&](int r, int c) -> half&  { return P_smem[r*Bc+c]; };
     auto Os  = [&](int r, int c) -> float& { return O_smem[r*HEAD_DIM+c]; };
     auto Wt  = [&](int w, int r, int c) -> float& { return warp_tmp[(w*Br+r)*OUT_COLS_PER_WARP+c]; };
+
+    // Zero-initialize K/V double buffers to prevent NaN from uninitialized smem.
+    // When S < Bc, cp.async skips OOB rows (kv_row >= S), leaving those rows with
+    // stale smem data (potentially NaN). WMMA PV computes P[OOB]=0 × V[OOB]=NaN
+    // which is NaN under IEEE 754, corrupting the output. Zeroing once at kernel
+    // start ensures V_buf[OOB] == 0 → 0 * 0 = 0 (correct).
+    constexpr int KV_BUF_ELEMS = Bc * KV_STRIDE;
+    for (int i = tx; i < KV_BUF_ELEMS; i += TOTAL_THREADS) {
+        K_buf[0][i] = __float2half(0.0f);
+        K_buf[1][i] = __float2half(0.0f);
+        V_buf[0][i] = __float2half(0.0f);
+        V_buf[1][i] = __float2half(0.0f);
+    }
 
     // Initialize O_smem and softmax stats
     for (int i = tx; i < Br * HEAD_DIM; i += TOTAL_THREADS)
@@ -374,7 +388,7 @@ __global__ void flash_attention_prefill_kernel(
 }
 
 // =============================================================================
-// Paged Attention Decode Kernel  (unchanged — inference only, already fast)
+// Paged Attention Decode Kernel v1  (scalar baseline — block=1)
 // =============================================================================
 
 template<int HEAD_DIM, int BLOCK_SIZE>
@@ -443,10 +457,172 @@ __global__ void paged_attention_decode_kernel(
     }
 
     half* out_ptr = out + (seq_idx * H_q + h_q) * HEAD_DIM;
-    const float inv = 1.0f / sum_exp;
+    const float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
     #pragma unroll
     for (int d = 0; d < HEAD_DIM; d++)
         out_ptr[d] = __float2half(acc[d] * inv);
+}
+
+// =============================================================================
+// Paged Attention Decode Kernel v2  (warp-parallel — block=32)
+//
+// Optimization: one warp (32 threads) per (seq, head) instead of one thread.
+//   - Each thread owns ELEMS = HEAD_DIM/32 = 4 consecutive elements.
+//   - K/V reads are coalesced: 32 threads × 4 halves = 128 halves in one
+//     cache-line transaction instead of 8 serial single-thread cache lines.
+//   - Dot product: partial sum per thread, then 5-step warp butterfly reduce.
+//   - No __syncthreads needed — all within a single warp.
+//   - Online softmax scalars (max_score, sum_exp) are identical on all threads
+//     after the reduce, so each thread updates them independently.
+//   - Vectorized 8-byte int2 load per thread per token (4 halves at once).
+// =============================================================================
+
+// Flash Decoding decode kernel: NUM_WARPS warps per (seq, head) split the context
+// length in a strided pattern, accumulate partial softmax states, then merge.
+//
+// Grid:  (num_seqs, H_q)
+// Block: (32 * NUM_WARPS)
+// Smem:  (2*NUM_WARPS + NUM_WARPS*HEAD_DIM) * sizeof(float)
+//
+// Each warp independently iterates over blocks [warp_id, warp_id+NUM_WARPS, ...],
+// maintaining its own online-softmax state (warp_max, warp_sum, warp_acc).
+// After __syncthreads(), warp 0 merges all partials and writes the final output.
+template<int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void paged_attention_decode_warp_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    half*       __restrict__ out,
+    const int*  __restrict__ block_tables,
+    const int*  __restrict__ seq_lens,
+    float scale,
+    int max_blocks_per_seq,
+    int H_q, int H_kv
+) {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be divisible by 32");
+    constexpr int ELEMS = HEAD_DIM / 32;  // elements per thread
+
+    const int seq_idx = blockIdx.x;
+    const int h_q     = blockIdx.y;
+    const int lane    = threadIdx.x % 32;        // lane within warp [0..31]
+    const int warp_id = threadIdx.x / 32;        // warp index [0..NUM_WARPS-1]
+    const int h_kv    = h_q * H_kv / H_q;
+
+    const int context_len = seq_lens[seq_idx];
+    const int num_blocks  = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // All warps load Q (same value for all warps in this block)
+    float q_reg[ELEMS];
+    {
+        const half* q_ptr = q + (seq_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        const int2  raw   = *reinterpret_cast<const int2*>(q_ptr);
+        const half2 lo    = *reinterpret_cast<const half2*>(&raw.x);
+        const half2 hi    = *reinterpret_cast<const half2*>(&raw.y);
+        const float2 lo_f = __half22float2(lo);
+        const float2 hi_f = __half22float2(hi);
+        q_reg[0] = lo_f.x;  q_reg[1] = lo_f.y;
+        q_reg[2] = hi_f.x;  q_reg[3] = hi_f.y;
+    }
+
+    // Per-warp partial softmax state
+    float warp_max = -INFINITY;
+    float warp_sum = 0.0f;
+    float warp_acc[ELEMS];
+    #pragma unroll
+    for (int d = 0; d < ELEMS; d++) warp_acc[d] = 0.0f;
+
+    const int* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Strided over KV blocks: warp w handles blocks w, w+NUM_WARPS, w+2*NUM_WARPS, ...
+    for (int blk = warp_id; blk < num_blocks; blk += NUM_WARPS) {
+        const int physical_block  = seq_block_table[blk];
+        const int tokens_in_block = min(BLOCK_SIZE, context_len - blk * BLOCK_SIZE);
+        const long block_base =
+            ((long)physical_block * H_kv + h_kv) * BLOCK_SIZE * HEAD_DIM;
+
+        for (int tok = 0; tok < tokens_in_block; tok++) {
+            const half* k_ptr = k_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+            const half* v_ptr = v_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+
+            const int2   k_raw = *reinterpret_cast<const int2*>(k_ptr);
+            const float2 k_lo  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.x));
+            const float2 k_hi  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.y));
+
+            float partial = q_reg[0] * k_lo.x + q_reg[1] * k_lo.y
+                          + q_reg[2] * k_hi.x + q_reg[3] * k_hi.y;
+
+            // Warp butterfly reduce → full dot product on all lanes
+            #pragma unroll
+            for (int mask = 16; mask >= 1; mask >>= 1)
+                partial += __shfl_xor_sync(0xFFFFFFFF, partial, mask);
+            const float score = partial * scale;
+
+            // Per-warp online softmax
+            const float new_max = fmaxf(warp_max, score);
+            const float alpha   = expf(warp_max - new_max);
+            const float p       = expf(score - new_max);
+            warp_sum   = warp_sum * alpha + p;
+            warp_max   = new_max;
+
+            const int2   v_raw = *reinterpret_cast<const int2*>(v_ptr);
+            const float2 v_lo  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.x));
+            const float2 v_hi  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.y));
+            warp_acc[0] = warp_acc[0] * alpha + p * v_lo.x;
+            warp_acc[1] = warp_acc[1] * alpha + p * v_lo.y;
+            warp_acc[2] = warp_acc[2] * alpha + p * v_hi.x;
+            warp_acc[3] = warp_acc[3] * alpha + p * v_hi.y;
+        }
+    }
+
+    // --- Cross-warp merge via shared memory ---
+    // Layout: [smem_max: NUM_WARPS floats][smem_sum: NUM_WARPS floats]
+    //         [smem_acc: NUM_WARPS * HEAD_DIM floats]
+    extern __shared__ float smem[];
+    float* smem_max = smem;
+    float* smem_sum = smem_max + NUM_WARPS;
+    float* smem_acc = smem_sum + NUM_WARPS;  // [NUM_WARPS][HEAD_DIM]
+
+    // Each lane stores its ELEMS elements for its warp's partial accumulator
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++)
+        smem_acc[warp_id * HEAD_DIM + lane * ELEMS + e] = warp_acc[e];
+
+    if (lane == 0) {
+        smem_max[warp_id] = warp_max;
+        smem_sum[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    // Warp 0 merges all NUM_WARPS partials and writes output
+    if (warp_id == 0) {
+        // Global max
+        float global_max = smem_max[0];
+        #pragma unroll
+        for (int w = 1; w < NUM_WARPS; w++)
+            global_max = fmaxf(global_max, smem_max[w]);
+
+        // Rescale and accumulate
+        float global_sum = 0.0f;
+        float final_acc[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) final_acc[e] = 0.0f;
+
+        #pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++) {
+            const float alpha = expf(smem_max[w] - global_max);
+            global_sum += smem_sum[w] * alpha;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                final_acc[e] += smem_acc[w * HEAD_DIM + lane * ELEMS + e] * alpha;
+        }
+
+        // Write output (guard sum==0 from empty context / warmup)
+        const float inv = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+        half* out_ptr = out + (seq_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            out_ptr[e] = __float2half(final_acc[e] * inv);
+    }
 }
 
 // =============================================================================
@@ -1061,10 +1237,20 @@ void launch_flash_attention_prefill(
       + NUM_WARPS * Br * (128 / NUM_WARPS) * sizeof(float) // warp_tmp
       + Br * 3               * sizeof(float);          // s_row_max/sum/alpha
 
+    static bool fa2_attr_set = false;
     auto kernel_fn = flash_attention_prefill_kernel<128, Br, Bc, NUM_WARPS>;
-    cudaFuncSetAttribute(kernel_fn,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_bytes);   // 96704 B < device opt-in max (101376 B)
+    if (!fa2_attr_set) {
+        cudaError_t _e = cudaFuncSetAttribute(kernel_fn,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             smem_bytes);
+        if (_e != cudaSuccess) {
+            fprintf(stderr, "[FA2] FATAL: cudaFuncSetAttribute failed (%s) "
+                    "requesting %d B smem.\n", cudaGetErrorString(_e), smem_bytes);
+            fflush(stderr);
+        } else {
+            fa2_attr_set = true;
+        }
+    }
 
     kernel_fn<<<grid, block, smem_bytes, stream>>>(
         Q, K, V, O, lse, B, S, H_q, H_kv, scale
@@ -1084,10 +1270,15 @@ void launch_paged_attention_decode(
 ) {
     const float scale = 1.0f / sqrtf((float)head_dim);
 
+    // 8 warps per (seq, head): split KV context across warps for better GPU occupancy
+    // and memory-latency hiding, then merge with a shared-memory reduction.
+    constexpr int NUM_WARPS = 8;
     dim3 grid(num_seqs, H_q);
-    dim3 block(1);
+    dim3 block(32 * NUM_WARPS);
+    // smem: [smem_max: NW] + [smem_sum: NW] + [smem_acc: NW * HEAD_DIM]  (all float)
+    size_t smem = (2 * NUM_WARPS + NUM_WARPS * 128) * sizeof(float);
 
-    paged_attention_decode_kernel<128, 16><<<grid, block, 0, stream>>>(
+    paged_attention_decode_warp_kernel<128, 16, NUM_WARPS><<<grid, block, smem, stream>>>(
         q, k_cache, v_cache, out,
         block_tables, seq_lens,
         scale, max_blocks_per_seq, H_q, H_kv

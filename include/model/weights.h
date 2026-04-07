@@ -27,12 +27,16 @@ struct Qwen3LayerWeights {
     half*  q_proj;               // [q_dim, hidden_size]
     half*  k_proj;               // [kv_dim, hidden_size]
     half*  v_proj;               // [kv_dim, hidden_size]
+    // qkv_proj == q_proj; contiguous [q_dim+kv_dim+kv_dim, hidden_size] (for fused GEMM)
+    half*  qkv_proj;
     half*  o_proj;               // [hidden_size, q_dim]
     float* q_norm;               // [head_dim]                 FP32 — QK-Norm weights
     float* k_norm;               // [head_dim]                 FP32 — QK-Norm weights
     float* post_attn_layernorm;  // [hidden_size]              FP32
     half*  gate_proj;            // [intermediate_size, hidden_size]
     half*  up_proj;              // [intermediate_size, hidden_size]
+    // gate_up_proj == gate_proj; contiguous [2*intermediate_size, hidden_size] (for fused GEMM)
+    half*  gate_up_proj;
     half*  down_proj;            // [hidden_size, intermediate_size]
 };
 

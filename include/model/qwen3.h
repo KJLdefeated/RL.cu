@@ -43,7 +43,7 @@ struct Qwen3Model {
     float* cos_table = nullptr;
     float* sin_table = nullptr;
 
-    // Scratch buffers — allocated once for max_T = max_batch * max_seq
+    // Scratch buffers — allocated once for max_T = max_batched_tokens
     half*    d_hidden    = nullptr;  // [max_T, hidden_size]
     half*    d_residual  = nullptr;  // [max_T, hidden_size]
     half*    d_Q         = nullptr;  // [max_T, q_dim]
@@ -58,11 +58,14 @@ struct Qwen3Model {
     int*     d_tokens    = nullptr;  // [max_T]
     int64_t* d_slot_map  = nullptr;  // [max_T]
 
-    // Host-side mirrors (updated each forward pass on CPU, then H2D copied)
-    int*     h_block_tables = nullptr;  // [max_batch, max_blocks_per_seq]
-    int*     h_seq_lens     = nullptr;  // [max_batch]
-    int64_t* h_slot_map     = nullptr;  // [max_T]
-    int*     h_pos_ids      = nullptr;  // [max_T]
+    // Host-side mirrors — all pinned (cudaMallocHost) for fast H2D cudaMemcpyAsync
+    int*     h_block_tables        = nullptr;  // [max_batch × max_blocks_per_seq]
+    int*     h_seq_lens            = nullptr;  // [max_batch]
+    int64_t* h_slot_map            = nullptr;  // [max_T]
+    int*     h_pos_ids             = nullptr;  // [max_T]
+    int*     h_tokens              = nullptr;  // [max_T]  prefill+decode input tokens
+    int*     h_block_table_compact = nullptr;  // [max_batch × max_blocks_per_seq] decode compact
+    int*     h_seq_lens_compact    = nullptr;  // [max_batch] decode compact
 
     int max_batch      = 0;
     int max_seq        = 0;
@@ -80,6 +83,11 @@ void qwen3_reset(Qwen3Model* model);
 half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch, cudaStream_t stream = 0);
 
 half* qwen3_decode(Qwen3Model* model, const std::vector<Sequence*>& batch, cudaStream_t stream = 0);
+
+// Graph-accelerated decode: copies inputs into graph's fixed device buffers,
+// pads to bucket size, then fires a single cudaGraphLaunch instead of 400+ kernels.
+// Falls back to qwen3_decode() if B > max captured bucket.
+half* qwen3_decode_graph(Qwen3Model* model, const std::vector<Sequence*>& batch, cudaStream_t stream = 0);
 
 void qwen3_layer_forward(Qwen3Model* m, int layer_idx, int T, int B, int S,
                          bool is_prefill, cudaStream_t stream);

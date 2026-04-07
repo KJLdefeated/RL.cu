@@ -248,16 +248,17 @@ void qwen3_layer_forward(
     const Qwen3Config&       c = m->config;
     const Qwen3LayerWeights& L = m->weights.layers[layer_idx];
 
-    // Attention block
+    // Attention block: save hidden as residual, then normalize in-place.
     CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden,
                                (long)T * c.hidden_size * sizeof(half),
                                cudaMemcpyDeviceToDevice, stream));
-    // LayerNorm  (x=d_residual, out=d_hidden — separate buffers)
     launch_rmsnorm(m->d_hidden, m->d_residual, L.input_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
-    // QKV projections
-    linear_half(m->cublas, m->d_hidden, L.q_proj, m->d_Q, T, c.q_dim,  c.hidden_size);
-    linear_half(m->cublas, m->d_hidden, L.k_proj, m->d_K, T, c.kv_dim, c.hidden_size);
-    linear_half(m->cublas, m->d_hidden, L.v_proj, m->d_V, T, c.kv_dim, c.hidden_size);
+    // QKV projections — separate GEMMs so Q[T,q_dim], K[T,kv_dim], V[T,kv_dim]
+    // are each packed contiguously (fused output is interleaved [Q[t]|K[t]|V[t]]
+    // which would mismatch the packed alias pointers for T>1).
+    linear_half(m->cublas, m->d_hidden, L.q_proj, m->d_Q, T, c.q_dim,  c.hidden_size, stream);
+    linear_half(m->cublas, m->d_hidden, L.k_proj, m->d_K, T, c.kv_dim, c.hidden_size, stream);
+    linear_half(m->cublas, m->d_hidden, L.v_proj, m->d_V, T, c.kv_dim, c.hidden_size, stream);
 
     // QK-Norm per head — BEFORE RoPE (critical Qwen3 ordering)
     launch_rmsnorm(m->d_Q, m->d_Q, L.q_norm, T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
@@ -294,27 +295,27 @@ void qwen3_layer_forward(
     }
 
     // O projection + residual
-    linear_half(m->cublas, m->d_attn_out, L.o_proj, m->d_hidden, T, c.hidden_size, c.q_dim);
+    linear_half(m->cublas, m->d_attn_out, L.o_proj, m->d_hidden, T, c.hidden_size, c.q_dim, stream);
     add_residual(m->d_hidden, m->d_residual, T * c.hidden_size, stream);
 
-    // Save post-attention hidden as residual
-    CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden, (long)T * c.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice, stream));
-
-    // Post-attention LayerNorm
+    // MLP block: save post-attn hidden as residual, then normalize.
+    CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden,
+                               (long)T * c.hidden_size * sizeof(half),
+                               cudaMemcpyDeviceToDevice, stream));
     launch_rmsnorm(m->d_hidden, m->d_residual,
                    L.post_attn_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
 
-    // Gate + Up projections
+    // Gate + up projections — separate GEMMs (same interleaving issue as QKV for T>1)
     linear_half(m->cublas, m->d_hidden, L.gate_proj,
-                m->d_gate, T, c.intermediate_size, c.hidden_size);
+                m->d_gate, T, c.intermediate_size, c.hidden_size, stream);
     linear_half(m->cublas, m->d_hidden, L.up_proj,
-                m->d_up,   T, c.intermediate_size, c.hidden_size);
+                m->d_up,   T, c.intermediate_size, c.hidden_size, stream);
 
     // SwiGLU: mlp_mid[i] = silu(gate[i]) * up[i]
     launch_swiglu(m->d_mlp_mid, m->d_gate, m->d_up, T * c.intermediate_size, stream);
 
     // Down projection + residual
-    linear_half(m->cublas, m->d_mlp_mid, L.down_proj, m->d_hidden, T, c.hidden_size, c.intermediate_size);
+    linear_half(m->cublas, m->d_mlp_mid, L.down_proj, m->d_hidden, T, c.hidden_size, c.intermediate_size, stream);
     add_residual(m->d_hidden, m->d_residual, T * c.hidden_size, stream);
 }
 
@@ -326,7 +327,7 @@ void compute_logits(Qwen3Model* m, int B, int S, cudaStream_t stream) {
     launch_rmsnorm(m->d_residual, m->d_residual,
                    m->weights.final_norm, B, c.hidden_size, c.rms_norm_eps, stream);
     linear_half(m->cublas, m->d_residual, m->weights.lm_head,
-                m->d_logits, B, c.vocab_size, c.hidden_size);
+                m->d_logits, B, c.vocab_size, c.hidden_size, stream);
 }
 
 // Load model from dist
@@ -361,24 +362,31 @@ Qwen3Model* qwen3_load(const std::string& model_dir, int max_batch, int max_seq)
     // Scratch buffers
     CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size       * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size       * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_Q,        (long)max_T * c.q_dim             * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_K,        (long)max_T * c.kv_dim            * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_V,        (long)max_T * c.kv_dim            * sizeof(half)));
+    // Fused QKV: single allocation, Q/K/V are aliases
+    CUDA_CHECK(cudaMalloc(&m->d_qkv,      (long)max_T * (c.q_dim + 2*c.kv_dim) * sizeof(half)));
+    m->d_Q = m->d_qkv;
+    m->d_K = m->d_qkv + (long)max_T * c.q_dim;
+    m->d_V = m->d_qkv + (long)max_T * (c.q_dim + c.kv_dim);
     CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim             * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_gate,     (long)max_T * c.intermediate_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_up,       (long)max_T * c.intermediate_size * sizeof(half)));
+    // Fused gate+up: single allocation, gate/up are aliases
+    CUDA_CHECK(cudaMalloc(&m->d_gate_up,  (long)max_T * 2*c.intermediate_size * sizeof(half)));
+    m->d_gate = m->d_gate_up;
+    m->d_up   = m->d_gate_up + (long)max_T * c.intermediate_size;
     CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_logits,   (long)max_batch * c.vocab_size    * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_slot_map, (long)max_T * sizeof(int64_t)));
 
-    // Host mirrors
+    // Host mirrors — pinned for fast H2D cudaMemcpyAsync
     int mbps = m->kv_cache.max_blocks_per_seq;
-    m->h_block_tables = new int[(long)max_batch * mbps];
-    m->h_seq_lens     = new int[max_batch];
-    m->h_slot_map     = new int64_t[max_T];
-    m->h_pos_ids      = new int[max_T];
+    CUDA_CHECK(cudaMallocHost(&m->h_block_tables, (long)max_batch * mbps * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_seq_lens,     max_batch * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_slot_map,     (long)max_T * sizeof(int64_t)));
+    CUDA_CHECK(cudaMallocHost(&m->h_pos_ids,      (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_tokens,       (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_block_table_compact, (long)max_batch * mbps * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_seq_lens_compact,    max_batch * sizeof(int)));
     memset(m->h_block_tables, -1, (long)max_batch * mbps * sizeof(int));
     memset(m->h_seq_lens,      0, max_batch * sizeof(int));
 
@@ -411,12 +419,16 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
     // Scratch buffers (using max_T, not max_batch × max_seq)
     CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size       * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size       * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_Q,        (long)max_T * c.q_dim             * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_K,        (long)max_T * c.kv_dim            * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_V,        (long)max_T * c.kv_dim            * sizeof(half)));
+    // Fused QKV: single allocation, Q/K/V are aliases
+    CUDA_CHECK(cudaMalloc(&m->d_qkv,      (long)max_T * (c.q_dim + 2*c.kv_dim) * sizeof(half)));
+    m->d_Q = m->d_qkv;
+    m->d_K = m->d_qkv + (long)max_T * c.q_dim;
+    m->d_V = m->d_qkv + (long)max_T * (c.q_dim + c.kv_dim);
     CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim             * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_gate,     (long)max_T * c.intermediate_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_up,       (long)max_T * c.intermediate_size * sizeof(half)));
+    // Fused gate+up: single allocation, gate/up are aliases
+    CUDA_CHECK(cudaMalloc(&m->d_gate_up,  (long)max_T * 2*c.intermediate_size * sizeof(half)));
+    m->d_gate = m->d_gate_up;
+    m->d_up   = m->d_gate_up + (long)max_T * c.intermediate_size;
     CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_logits,   (long)max_batch * c.vocab_size    * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
@@ -442,12 +454,15 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
     launch_rope_precompute(m->cos_table, m->sin_table,
                            c.max_position_embeddings, c.head_dim, c.rope_theta);
 
-    // Host mirrors
+    // Host mirrors — pinned for fast H2D cudaMemcpyAsync
     int mbps = m->kv_cache.max_blocks_per_seq;
-    m->h_block_tables = new int[(long)max_batch * mbps];
-    m->h_seq_lens     = new int[max_batch];
-    m->h_slot_map     = new int64_t[max_T];
-    m->h_pos_ids      = new int[max_T];
+    CUDA_CHECK(cudaMallocHost(&m->h_block_tables, (long)max_batch * mbps * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_seq_lens,     max_batch * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_slot_map,     (long)max_T * sizeof(int64_t)));
+    CUDA_CHECK(cudaMallocHost(&m->h_pos_ids,      (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_tokens,       (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_block_table_compact, (long)max_batch * mbps * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_seq_lens_compact,    max_batch * sizeof(int)));
     memset(m->h_block_tables, -1, (long)max_batch * mbps * sizeof(int));
     memset(m->h_seq_lens,      0, max_batch * sizeof(int));
 
@@ -467,16 +482,18 @@ void qwen3_free(Qwen3Model* m) {
     if (m->cublas) cublasDestroy(m->cublas);
     cudaFree(m->cos_table);   cudaFree(m->sin_table);
     cudaFree(m->d_hidden);    cudaFree(m->d_residual);
-    cudaFree(m->d_Q);         cudaFree(m->d_K);
-    cudaFree(m->d_V);         cudaFree(m->d_attn_out);
-    cudaFree(m->d_gate);      cudaFree(m->d_up);
+    cudaFree(m->d_qkv);       cudaFree(m->d_attn_out);
+    cudaFree(m->d_gate_up);
     cudaFree(m->d_mlp_mid);   cudaFree(m->d_logits);
     cudaFree(m->d_pos_ids);   cudaFree(m->d_slot_map);
     cudaFree(m->d_tokens);
-    delete[] m->h_block_tables;
-    delete[] m->h_seq_lens;
-    delete[] m->h_slot_map;
-    delete[] m->h_pos_ids;
+    cudaFreeHost(m->h_block_tables);
+    cudaFreeHost(m->h_seq_lens);
+    cudaFreeHost(m->h_slot_map);
+    cudaFreeHost(m->h_pos_ids);
+    cudaFreeHost(m->h_tokens);
+    cudaFreeHost(m->h_block_table_compact);
+    cudaFreeHost(m->h_seq_lens_compact);
     delete m;
 }
 
@@ -510,10 +527,6 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
     const Qwen3Config& c = m->config;
     int B = batch.size();
 
-    std::vector<int> h_tokens, h_pos_ids;
-    std::vector<int64_t> h_slot_map;
-    std::vector<int> h_cu_seqlens = {0}; //cumulative sequence lengths for launch_embedding
-
     // Collect per-sequence tokens; pad to max length so the batch is uniform.
     int mbps = m->kv_cache.max_blocks_per_seq;
     std::vector<int> actual_lens(B);
@@ -526,6 +539,8 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
         if (actual_lens[b] > S) S = actual_lens[b];
     }
 
+    // Build token/position/slot arrays directly into pinned buffers
+    int t = 0;
     for (int b = 0; b < B; b++) {
         const Sequence* seq = batch[b];
         int slot  = seq->batch_slot;
@@ -537,28 +552,25 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
             for (int j = 0; j < mbps; j++)
                 m->h_block_tables[(long)slot * mbps + j] = -1;
         }
-        for (int i = start; i < end; i++){
-            h_tokens.push_back(seq->token_ids[i]);
-            h_pos_ids.push_back(i);
-            h_slot_map.push_back(
-                paged_kv_cache_append_slot(m->kv_cache, m->h_block_tables, m->h_seq_lens, slot)
-            );
+        for (int i = start; i < end; i++, t++) {
+            m->h_tokens[t]   = (int)seq->token_ids[i];
+            m->h_pos_ids[t]  = i;
+            m->h_slot_map[t] = paged_kv_cache_append_slot(m->kv_cache, m->h_block_tables, m->h_seq_lens, slot);
         }
         // Pad shorter sequences to S; padding slots = -1 → KV write is skipped.
-        for (int p = actual_lens[b]; p < S; p++) {
-            h_tokens.push_back(0);
-            h_pos_ids.push_back(0);
-            h_slot_map.push_back(-1LL);
+        for (int p = actual_lens[b]; p < S; p++, t++) {
+            m->h_tokens[t]   = 0;
+            m->h_pos_ids[t]  = 0;
+            m->h_slot_map[t] = -1LL;
         }
-        h_cu_seqlens.push_back(h_cu_seqlens.back() + S);
     }
 
     int T = B * S;
 
     CUBLAS_CHECK(cublasSetStream(m->cublas, stream));
-    CUDA_CHECK(cudaMemcpyAsync(m->d_tokens, h_tokens.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(m->d_pos_ids, h_pos_ids.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(m->d_slot_map, h_slot_map.data(), T * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(m->d_tokens,   m->h_tokens,   T * sizeof(int),     cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(m->d_pos_ids,  m->h_pos_ids,  T * sizeof(int),     cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(m->d_slot_map, m->h_slot_map, T * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.seq_lens, m->h_seq_lens, m->max_batch * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     launch_embedding(m->d_hidden, m->weights.embed_tokens, m->d_tokens, T, c.vocab_size, c.hidden_size, stream);
@@ -567,12 +579,11 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
         qwen3_layer_forward(m, l, T, B, S, true, stream);
 
     // Gather the last *real* token of each sequence (padding may make sequences unequal in len).
-    // Reuse d_tokens as a temporary int[B] buffer for offsets.
+    // Reuse d_tokens as a temporary int[B] buffer for offsets; h_tokens is pinned.
     {
-        std::vector<int> h_offsets(B);
         for (int b = 0; b < B; b++)
-            h_offsets[b] = b * S + actual_lens[b] - 1;
-        CUDA_CHECK(cudaMemcpyAsync(m->d_tokens, h_offsets.data(), B * sizeof(int),
+            m->h_tokens[b] = b * S + actual_lens[b] - 1;
+        CUDA_CHECK(cudaMemcpyAsync(m->d_tokens, m->h_tokens, B * sizeof(int),
                                    cudaMemcpyHostToDevice, stream));
         gather_at_offsets_kernel<<<B, 256, 0, stream>>>(
             m->d_residual, m->d_hidden, m->d_tokens, c.hidden_size);
@@ -580,7 +591,7 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
     launch_rmsnorm(m->d_residual, m->d_residual,
                    m->weights.final_norm, B, c.hidden_size, c.rms_norm_eps, stream);
     linear_half(m->cublas, m->d_residual, m->weights.lm_head,
-                m->d_logits, B, c.vocab_size, c.hidden_size);
+                m->d_logits, B, c.vocab_size, c.hidden_size, stream);
 
     return m->d_logits;
 }
@@ -590,12 +601,11 @@ half* qwen3_decode(Qwen3Model* m, const std::vector<Sequence*>& batch,
                     cudaStream_t stream) {
     const Qwen3Config& c = m->config;
     int B = batch.size();
-    // One token per sequence
-    std::vector<int> h_tokens;
-    for (auto* seq : batch)
-        h_tokens.push_back(seq->last_token_id);
+    // One token per sequence — write directly into pre-allocated pinned buffer
+    for (int b = 0; b < B; b++)
+        m->h_tokens[b] = (int)batch[b]->last_token_id;
 
-    CUDA_CHECK(cudaMemcpyAsync(m->d_tokens, h_tokens.data(),
+    CUDA_CHECK(cudaMemcpyAsync(m->d_tokens, m->h_tokens,
                                B * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     CUBLAS_CHECK(cublasSetStream(m->cublas, stream));
@@ -604,14 +614,13 @@ half* qwen3_decode(Qwen3Model* m, const std::vector<Sequence*>& batch,
     // Each sequence has a stable batch_slot that indexes h_block_tables / h_seq_lens.
     // The GPU decode kernel uses contiguous rows 0..B-1, so we remap here.
     int mbps = m->kv_cache.max_blocks_per_seq;
-    std::vector<int>  h_block_table_compact(B * mbps, -1);
-    std::vector<int>  h_seq_lens_compact(B, 0);
+    memset(m->h_block_table_compact, -1, (long)B * mbps * sizeof(int));
     for (int b = 0; b < B; b++) {
         int slot = batch[b]->batch_slot;
         m->h_slot_map[b] = paged_kv_cache_append_slot(m->kv_cache, m->h_block_tables, m->h_seq_lens, slot);
         m->h_pos_ids[b]  = m->h_seq_lens[slot] - 1;
-        h_seq_lens_compact[b] = m->h_seq_lens[slot];
-        memcpy(&h_block_table_compact[b * mbps],
+        m->h_seq_lens_compact[b] = m->h_seq_lens[slot];
+        memcpy(&m->h_block_table_compact[b * mbps],
                m->h_block_tables + (long)slot * mbps,
                mbps * sizeof(int));
     }
@@ -620,10 +629,10 @@ half* qwen3_decode(Qwen3Model* m, const std::vector<Sequence*>& batch,
                                B * sizeof(int), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(m->d_slot_map, m->h_slot_map,
                                B * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.block_tables, h_block_table_compact.data(),
+    CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.block_tables, m->h_block_table_compact,
                                (long)B * mbps * sizeof(int),
                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.seq_lens, h_seq_lens_compact.data(),
+    CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.seq_lens, m->h_seq_lens_compact,
                                B * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Token embedding → d_hidden [B, hidden_size]
@@ -635,6 +644,74 @@ half* qwen3_decode(Qwen3Model* m, const std::vector<Sequence*>& batch,
 
     // S=1 → gather_last_tokens is a trivial copy of d_hidden → d_residual
     compute_logits(m, B, /*S=*/1, stream);
+
+    return m->d_logits;
+}
+
+// =============================================================================
+// Graph-accelerated decode
+// =============================================================================
+// All work in qwen3_decode has two phases:
+//   1. CPU/H2D prep  — appends KV slots, builds compact arrays, H2D copies
+//   2. GPU forward   — embedding + 28 layers + logits (400+ kernel launches)
+//
+// CUDA graphs eliminate phase-2 overhead by replaying the captured GPU work as
+// a single cudaGraphLaunch (~90 µs) instead of 400+ individual launches (~2 ms).
+//
+// The captured graph references fixed device buffers (gs.g_token_ids etc.).
+// We H2D into those buffers, pad ghost sequences to the bucket size (seq_len=0
+// so attention does nothing; slot=-1 so KV write is skipped), then launch.
+// =============================================================================
+half* qwen3_decode_graph(Qwen3Model* m, const std::vector<Sequence*>& batch,
+                          cudaStream_t stream) {
+    CUDAGraphState& gs = m->graph_state;
+    int B    = (int)batch.size();
+    int mbps = m->kv_cache.max_blocks_per_seq;
+
+    // Find the smallest captured bucket >= B.
+    int B_bucket = -1;
+    for (int b : gs.buckets) {
+        if (b >= B) { B_bucket = b; break; }
+    }
+    if (B_bucket < 0)
+        return qwen3_decode(m, batch, stream);   // B > max bucket → eager fallback
+
+    // ── CPU prep (same logic as qwen3_decode) ────────────────────────────────
+    // Real sequences
+    memset(m->h_block_table_compact, -1, (long)B_bucket * mbps * sizeof(int));
+    for (int b = 0; b < B; b++) {
+        int slot = batch[b]->batch_slot;
+        m->h_tokens[b]   = (int)batch[b]->last_token_id;
+        m->h_slot_map[b] = paged_kv_cache_append_slot(m->kv_cache, m->h_block_tables, m->h_seq_lens, slot);
+        m->h_pos_ids[b]  = m->h_seq_lens[slot] - 1;
+        m->h_seq_lens_compact[b] = m->h_seq_lens[slot];
+        memcpy(&m->h_block_table_compact[b * mbps],
+               m->h_block_tables + (long)slot * mbps,
+               mbps * sizeof(int));
+    }
+    // Ghost sequences — zero token, slot=-1 (KV write skipped), seq_len=0 (attn skip)
+    for (int b = B; b < B_bucket; b++) {
+        m->h_tokens[b]   = 0;
+        m->h_slot_map[b] = -1LL;
+        m->h_pos_ids[b]  = 0;
+        m->h_seq_lens_compact[b] = 0;
+        // h_block_table_compact[b*mbps:] already -1 from memset above
+    }
+
+    // ── H2D into graph's fixed device buffers ─────────────────────────────────
+    CUDA_CHECK(cudaMemcpyAsync(gs.g_token_ids,    m->h_tokens,
+                               B_bucket * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(gs.g_pos_ids,      m->h_pos_ids,
+                               B_bucket * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(gs.g_slot_map,     m->h_slot_map,
+                               B_bucket * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(gs.g_block_tables, m->h_block_table_compact,
+                               (long)B_bucket * mbps * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(gs.g_seq_lens,     m->h_seq_lens_compact,
+                               B_bucket * sizeof(int), cudaMemcpyHostToDevice, stream));
+
+    // ── Single graph launch replaces all 400+ individual kernel launches ───────
+    CUDA_CHECK(cudaGraphLaunch(gs.graphs[B_bucket], stream));
 
     return m->d_logits;
 }
@@ -799,11 +876,11 @@ void qwen3_forward(
 
         // QKV projections → save raw Q, K into state; V directly into state
         linear_half(m->cublas, m->d_hidden, L.q_proj,
-                    state->layer_Q_raw[l], T, c.q_dim, c.hidden_size);
+                    state->layer_Q_raw[l], T, c.q_dim, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.k_proj,
-                    state->layer_K_raw[l], T, c.kv_dim, c.hidden_size);
+                    state->layer_K_raw[l], T, c.kv_dim, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.v_proj,
-                    state->layer_V[l],     T, c.kv_dim, c.hidden_size);
+                    state->layer_V[l],     T, c.kv_dim, c.hidden_size, stream);
 
         // QK-Norm: Q_raw → Q, K_raw → K  (separate in/out, no copy needed)
         launch_rmsnorm(state->layer_Q[l], state->layer_Q_raw[l],
@@ -825,7 +902,7 @@ void qwen3_forward(
 
         // O projection + residual
         linear_half(m->cublas, state->layer_O[l], L.o_proj,
-                    m->d_hidden, T, c.hidden_size, c.q_dim);
+                    m->d_hidden, T, c.hidden_size, c.q_dim, stream);
         add_residual(m->d_hidden, state->layer_input[l], T * c.hidden_size, stream);
 
         // Save post-attention hidden (residual for MLP block)
@@ -839,9 +916,9 @@ void qwen3_forward(
 
         // Gate/Up projections → save into state
         linear_half(m->cublas, m->d_hidden, L.gate_proj,
-                    state->layer_gate[l], T, c.intermediate_size, c.hidden_size);
+                    state->layer_gate[l], T, c.intermediate_size, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.up_proj,
-                    state->layer_up[l],   T, c.intermediate_size, c.hidden_size);
+                    state->layer_up[l],   T, c.intermediate_size, c.hidden_size, stream);
 
         // SwiGLU → scratch d_mlp_mid (not saved; recomputable from gate+up)
         launch_swiglu(m->d_mlp_mid, state->layer_gate[l], state->layer_up[l],
@@ -849,7 +926,7 @@ void qwen3_forward(
 
         // Down projection + residual
         linear_half(m->cublas, m->d_mlp_mid, L.down_proj,
-                    m->d_hidden, T, c.hidden_size, c.intermediate_size);
+                    m->d_hidden, T, c.hidden_size, c.intermediate_size, stream);
         add_residual(m->d_hidden, state->layer_post_attn[l], T * c.hidden_size, stream);
     }
 
@@ -872,7 +949,7 @@ void qwen3_forward(
         linear_half(m->cublas,
                     m->d_residual + (long)start * c.hidden_size,
                     m->weights.lm_head,
-                    state->d_logits_train, n, c.vocab_size, c.hidden_size);
+                    state->d_logits_train, n, c.vocab_size, c.hidden_size, stream);
 
         // Log-softmax + gather target log-prob
         log_softmax_gather_kernel<<<n, 256, 0, stream>>>(
@@ -1021,7 +1098,7 @@ void qwen3_backward(
         linear_half(m->cublas,
                     m->d_residual + (long)start * H,
                     m->weights.lm_head,
-                    state->d_logits_train, n, V, H);
+                    state->d_logits_train, n, V, H, stream);
 
         // Backward log_softmax_gather: overwrite d_logits_train with gradients
         log_softmax_gather_backward_kernel<<<n, 256, 0, stream>>>(
