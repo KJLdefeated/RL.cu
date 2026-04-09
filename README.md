@@ -20,20 +20,17 @@
 
 ---
 
-A from-scratch implementation of the complete LLM RL pipeline — hand-written CUDA kernels, a vLLM-style inference engine with continuous batching, and GRPO training — all in a single binary with no Python runtime dependency.
-
-**Built for learning.** Every layer is explicit: when you read `qwen3_forward()`, you see exactly what happens — `embedding → rmsnorm → qkv_proj → qk_norm → rope → flash_attention → o_proj → swiglu → ...`. No hidden graph. No autograd tape. No framework magic. If you want to understand how LLM inference and RL training actually work at the GPU level, this is the codebase to read.
+A from-scratch implementation of the complete LLM RL pipeline — hand-written CUDA kernels, a vLLM-style inference engine with continuous batching, and GRPO training.
 
 ## What We Built
 
-| Layer | What | From Scratch? |
-|-------|------|:---:|
-| **CUDA Kernels** | FlashAttention-2 (fwd+bwd), RMSNorm, RoPE, SwiGLU, Embedding, Sampler, AdamW, GRPO loss — all with forward AND backward passes | Yes |
-| **Model** | Qwen3-0.6B full forward + backward pass, safetensors weight loading | Yes |
-| **KV Cache** | Paged KV cache with block manager (same design as vLLM) | Yes |
-| **Inference Engine** | Continuous batching, CUDA graph capture, two-phase scheduling | Yes |
-| **Tokenizer** | BPE tokenizer reading HuggingFace `tokenizer.json` directly | Yes |
-| **Training** | SFT + GRPO with gradient checkpointing, mixed-precision AdamW | Yes |
+| Layer | What |
+|-------|------|
+| **CUDA Kernels** | FlashAttention-2, RMSNorm, RoPE, SwiGLU, Embedding, Sampler, AdamW, GRPO loss — all with forward AND backward passes|
+| **Model** | Qwen3-0.6B full forward + backward pass, safetensors weight loading|
+| **KV Cache** | Paged KV cache with block manager (same design as vLLM)|
+| **Inference Engine** | Continuous batching, CUDA graph capture, two-phase scheduling|
+| **Training** | SFT + GRPO with gradient checkpointing, mixed-precision AdamW|
 
 ## Quick Start
 
@@ -73,7 +70,7 @@ make build/train_grpo
 
 ## Kernels
 
-Every kernel is hand-written with FP16 I/O and FP32 accumulation. Each has a standalone test comparing against a CPU/PyTorch reference.
+Every kernel is written with FP16 I/O and FP32 accumulation. Each has a standalone test comparing against a CPU/PyTorch reference.
 
 | Kernel | File | Lines | Key Design |
 |--------|------|------:|------------|
@@ -102,8 +99,9 @@ A vLLM-style engine with continuous batching, paged KV cache, and CUDA graph acc
 **Features:**
 - **Continuous batching** — two-phase decode + prefill per step, new requests start immediately
 - **Paged KV cache** — block-level memory management, no wasted pre-allocation
-- **CUDA graphs** — decode captured at bucket sizes (1, 2, 4, 8, ..., 256), single `cudaGraphLaunch` replaces 400+ kernel calls
-- **Fused projections** — QKV and gate+up projections fused into single GEMMs (zero extra memory)
+- **CUDA graphs** — decode captured at bucket sizes (1, 2, 4, 8, ..., 256)
+- **Fused projections** — QKV and gate+up projections fused into single GEMMs
+- **Train-inference mismatch = 0** - The GRPO policy ratio needs `log_probs_old` (rollout) and `log_probs_new` (training). Both come from the same `qwen3_forward()` — same kernels, same FP reduction order.
 
 ```
 Engine step:
@@ -117,7 +115,7 @@ Engine step:
 Standard cross-entropy training with chunked lm_head to control memory.
 
 ### GRPO (Group Relative Policy Optimization)
-Full RL training loop in a single CUDA binary:
+Full RL training loop:
 
 ```
 For each step:
@@ -129,9 +127,11 @@ For each step:
   6. AdamW update with gradient accumulation + clipping
 ```
 
-**Gradient checkpointing** saves only per-layer input residuals + FlashAttention LSE, recomputing all other activations during backward. This reduces activation memory from **~61 GB to ~6.4 GB** (54.8 GB saved) for batch of 64 sequences.
+**Gradient checkpointing** saves only per-layer input residuals + FlashAttention LSE, recomputing all other activations during backward.
 
 **Sleep/wakeup lifecycle:** KV cache pools are freed during training and re-allocated before generation, so the same GPU memory is shared between inference and training phases.
+
+**No weight transfer needed:** Inference phase and training phase maitain same weight, don't need weight transfer and avoid of inference-training mismatch.
 
 ## Benchmarks
 
@@ -152,7 +152,7 @@ For each step:
 | Activation memory (without checkpointing) | 61 GB |
 | Training step time | ~107s |
 
-Long context generation cause generation throughput degrade, we need to implement FlashDecoding KV-Split for handling long context.
+Note: Long context generation cause generation throughput degrade, we need to implement FlashDecoding KV-Split for handling long context.
 
 ## Architecture
 
@@ -186,14 +186,6 @@ RL.cu
 │   └── weights.h         #   Safetensors loader (mmap)
 └── tests/                # 26 test files, each kernel validated independently
 ```
-
-## Design Philosophy
-
-**One binary, one process, one GPU.** Rollout generation and policy training happen in the same CUDA context. No serialization overhead. No weight transfer. No Python GIL.
-
-**Train-inference mismatch = 0 by construction.** The GRPO policy ratio needs `log_probs_old` (rollout) and `log_probs_new` (training). Both come from the same `qwen3_forward()` — same kernels, same FP reduction order. The ratio is exactly 1.0 at the first iteration. This isn't a feature; it's a property of the architecture.
-
-**llm.c for RL.** [llm.c](https://github.com/karpathy/llm.c) showed that pretraining can be done in pure CUDA. We extend this to the full RL loop: generate → reward → advantage → loss → backward → optimize.
 
 ## Comparison
 
