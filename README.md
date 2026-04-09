@@ -152,6 +152,8 @@ For each step:
 | Activation memory (without checkpointing) | 61 GB |
 | Training step time | ~107s |
 
+Long context generation cause generation throughput degrade, we need to implement FlashDecoding KV-Split for handling long context.
+
 ## Architecture
 
 ```
@@ -272,14 +274,3 @@ Contributions welcome! Some areas where help would be great:
 - **More model architectures** — Llama, Gemma, etc.
 - **Speculative decoding** — draft model + verification
 - **Quantization** — INT8/INT4 weight quantization
-
-## Acknowledgments
-
-- [llm.c](https://github.com/karpathy/llm.c) by Andrej Karpathy — inspiration for "pure CUDA" approach
-- [vLLM](https://github.com/vllm-project/vllm) — paged attention and continuous batching design
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention) — attention algorithm
-- [CUTLASS](https://github.com/NVIDIA/cutlass) — WMMA primitives
-
-## License
-
-MIT
