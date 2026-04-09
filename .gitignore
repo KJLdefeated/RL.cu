@@ -22,6 +22,6 @@ include/third_party/
 # Data
 data/
 
-python_scripts/nano-vllm
+scripts/nano-vllm
 
 third_party/
