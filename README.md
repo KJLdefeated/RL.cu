@@ -49,7 +49,7 @@ git clone https://github.com/KJLdefeated/RL.cu.git && cd RL.cu
 
 # Download model weights
 pip install huggingface_hub
-python python_scripts/download_model.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
+python scripts/download_model.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
 
 # Build
 make build/test_llmengine
@@ -63,7 +63,7 @@ make build/test_llmengine
 ```bash
 # Prepare dataset (downloads DeepMath-103K as JSONL)
 pip install datasets
-python python_scripts/prepare_data.py --mode grpo-text \
+python scripts/prepare_data.py --mode grpo-text \
     --dataset trl-lib/DeepMath-103K --output data/deepmath-103k.jsonl
 
 # Build & run GRPO training
