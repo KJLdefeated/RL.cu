@@ -1,4 +1,5 @@
 #include "model/kv_cache.cuh"
+#include "cuda_utils.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -26,20 +27,20 @@ PagedKVCache paged_kv_cache_init(
     // GPU pool — one flat allocation for all layers
     const size_t pool_elems =
         (size_t)num_layers * total_blocks * num_kv_heads * KV_BLOCK_SIZE * head_dim;
-    cudaMalloc(&cache.k_pool, pool_elems * sizeof(half));
-    cudaMalloc(&cache.v_pool, pool_elems * sizeof(half));
-    cudaMemset(cache.k_pool, 0, pool_elems * sizeof(half));
-    cudaMemset(cache.v_pool, 0, pool_elems * sizeof(half));
+    CUDA_CHECK(cudaMalloc(&cache.k_pool, pool_elems * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&cache.v_pool, pool_elems * sizeof(half)));
+    CUDA_CHECK(cudaMemset(cache.k_pool, 0, pool_elems * sizeof(half)));
+    CUDA_CHECK(cudaMemset(cache.v_pool, 0, pool_elems * sizeof(half)));
 
     // Block tables and seq lens on GPU
-    cudaMalloc(&cache.block_tables,
-               (size_t)max_batch_size * max_blocks_per_seq * sizeof(int));
-    cudaMalloc(&cache.seq_lens, max_batch_size * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&cache.block_tables,
+               (size_t)max_batch_size * max_blocks_per_seq * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&cache.seq_lens, max_batch_size * sizeof(int)));
 
     // block_tables = -1 (unallocated), seq_lens = 0
-    cudaMemset(cache.block_tables, -1,
-               (size_t)max_batch_size * max_blocks_per_seq * sizeof(int));
-    cudaMemset(cache.seq_lens, 0, max_batch_size * sizeof(int));
+    CUDA_CHECK(cudaMemset(cache.block_tables, -1,
+               (size_t)max_batch_size * max_blocks_per_seq * sizeof(int)));
+    CUDA_CHECK(cudaMemset(cache.seq_lens, 0, max_batch_size * sizeof(int)));
 
     // CPU free-block stack: blocks 0..total_blocks-1 all free
     cache.free_stack = (int*)malloc(total_blocks * sizeof(int));

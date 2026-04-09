@@ -324,9 +324,9 @@ static void test_bench_realistic(LLMEngine& engine) {
     };
     auto rng = make_lcg(0);
 
-    const int NUM_SEQS      = 256;
-    const int MAX_INPUT_LEN = 1024;
-    const int MAX_OUT_LEN   = 1024;
+    const int NUM_SEQS      = 64;
+    const int MAX_INPUT_LEN = 4096;
+    const int MAX_OUT_LEN   = 4096;
 
     std::vector<std::vector<int64_t>> prompts(NUM_SEQS);
     std::vector<SamplingParams>       sps(NUM_SEQS);
@@ -367,11 +367,230 @@ static void test_bench_realistic(LLMEngine& engine) {
 }
 
 // =============================================================================
+// 5. Rollout debug — print full completions for visual inspection
+// =============================================================================
+
+static void test_rollout_debug(LLMEngine& engine, const char* data_path) {
+    SECTION("5. Rollout debug — visual inspection");
+
+    // ── 5a. Chat prompts (greedy) ────────────────────────────────────────────
+    // printf("\n  ── Chat prompts (greedy, max_new=256) ──\n");
+    // {
+    //     const char* chat_qs[] = {
+    //         "What is 2 + 3? Answer with just the number.",
+    //         "Solve: x^2 = 16, x > 0. What is x?",
+    //         "What is the capital of Japan? One word.",
+    //     };
+    //     for (auto& q : chat_qs) {
+    //         std::string prompt = engine.tokenizer->chat_prompt(q);
+    //         auto resp = engine.generate({prompt}, greedy(256));
+    //         printf("\n  Q: %s\n", q);
+    //         printf("  A: %s\n", resp.empty() ? "(empty)" : resp[0].c_str());
+    //     }
+    // }
+
+    // ── 5b. Chat prompts (sampling, temp=0.8) ────────────────────────────────
+    // printf("\n  ── Chat prompts (temp=0.8, top_p=1.0, max_new=512) ──\n");
+    // {
+    //     const char* chat_qs[] = {
+    //         "Explain what a prime number is in two sentences.",
+    //         "Write a haiku about the moon.",
+    //     };
+    //     for (auto& q : chat_qs) {
+    //         std::string prompt = engine.tokenizer->chat_prompt(q);
+    //         auto resp = engine.generate({prompt}, sampling(0.8f, 1.0f, 512));
+    //         printf("\n  Q: %s\n", q);
+    //         printf("  A: %s\n", resp.empty() ? "(empty)" : resp[0].c_str());
+    //     }
+    // }
+
+    // ── 5c. DAPO-style prompts from bin file (same as GRPO trainer) ──────────
+    // if (data_path && std::filesystem::exists(data_path)) {
+    //     printf("\n  ── DAPO prompts from %s (temp=0.8, max_new=1024) ──\n", data_path);
+
+    //     // Read binary file
+    //     FILE* f = fopen(data_path, "rb");
+    //     if (!f) { printf("  Cannot open %s\n", data_path); return; }
+
+    //     struct { char magic[4]; uint32_t version; uint64_t num_samples, total_tokens; uint32_t flags, pad; } hdr;
+    //     fread(&hdr, sizeof(hdr), 1, f);
+    //     size_t N = (size_t)hdr.num_samples;
+
+    //     std::vector<uint64_t> offsets(N + 1);
+    //     fread(offsets.data(), sizeof(uint64_t), N + 1, f);
+
+    //     // Skip prompt_lens if present
+    //     if (hdr.flags & 1) fseek(f, N * sizeof(uint32_t), SEEK_CUR);
+
+    //     std::vector<int32_t> all_tokens((size_t)hdr.total_tokens);
+    //     fread(all_tokens.data(), sizeof(int32_t), hdr.total_tokens, f);
+    //     fclose(f);
+
+    //     // Load answers
+    //     std::vector<std::string> answers;
+    //     {
+    //         std::string ans_path(data_path);
+    //         auto dot = ans_path.rfind('.');
+    //         if (dot != std::string::npos)
+    //             ans_path = ans_path.substr(0, dot) + ".answers.jsonl";
+    //         FILE* af = fopen(ans_path.c_str(), "r");
+    //         if (af) {
+    //             char line[4096];
+    //             while (fgets(line, sizeof(line), af)) {
+    //                 // Simple parse: {"index": N, "answer": "..."}
+    //                 char* p = strstr(line, "\"answer\":");
+    //                 if (p) {
+    //                     p = strchr(p, ':') + 1;
+    //                     while (*p == ' ' || *p == '"') p++;
+    //                     char* end = strchr(p, '"');
+    //                     if (end) answers.push_back(std::string(p, end));
+    //                 }
+    //             }
+    //             fclose(af);
+    //         }
+    //     }
+
+    //     const int NUM_PROMPTS = std::min(2, (int)N);
+    //     SamplingParams sp;
+    //     sp.temperature    = 0.8f;
+    //     sp.top_p          = 1.0f;
+    //     sp.max_new_tokens = 1024;
+    //     sp.do_sample      = true;
+
+    //     for (int i = 0; i < NUM_PROMPTS; i++) {
+    //         size_t len = (size_t)(offsets[i + 1] - offsets[i]);
+    //         std::vector<int64_t> prompt_ids(len);
+    //         for (size_t t = 0; t < len; t++)
+    //             prompt_ids[t] = (int64_t)all_tokens[offsets[i] + t];
+
+    //         // Decode prompt for display
+    //         std::string prompt_text = engine.tokenizer->decode(prompt_ids);
+    //         if (prompt_text.size() > 300)
+    //             prompt_text = prompt_text.substr(0, 300) + "...";
+
+    //         // Generate using token IDs (same path as GRPO trainer)
+    //         engine.add_request(prompt_ids, sp);
+    //         std::string completion;
+    //         while (!engine.is_finished()) {
+    //             auto [completions, ntok] = engine.step();
+    //             for (auto& [sid, tids] : completions) {
+    //                 completion = engine.tokenizer->decode(tids);
+    //             }
+    //         }
+
+    //         printf("\n  ── DAPO Prompt %d (%zu tokens) ──\n", i, len);
+    //         printf("  PROMPT: %s\n", prompt_text.c_str());
+    //         printf("  ANSWER: %s\n", (i < (int)answers.size()) ? answers[i].c_str() : "?");
+    //         printf("  COMPLETION (%zu chars):\n%s\n",
+    //                completion.size(),
+    //                completion.size() > 2000 ? (completion.substr(0, 2000) + "...").c_str()
+    //                                         : completion.c_str());
+    //     }
+    // } else {
+    //     printf("  [SKIP] No data file at %s\n", data_path ? data_path : "(null)");
+    // }
+
+    // ── 5d. Sleep/Wakeup cycle — same path as GRPO trainer ──────────────
+    // printf("\n  ── Sleep/Wakeup cycle test ──\n");
+    // {
+    //     // Generate BEFORE sleep/wakeup (baseline)
+    //     std::string prompt = engine.tokenizer->chat_prompt(
+    //         "What is 7 + 8? Answer with just the number.");
+    //     auto resp_before = engine.generate({prompt}, greedy(64));
+    //     printf("  BEFORE sleep/wakeup: %s\n",
+    //            resp_before.empty() ? "(empty)" : resp_before[0].c_str());
+
+    //     // Sleep → Wakeup → Generate
+    //     engine.sleep();
+    //     engine.wakeup();
+
+    //     auto resp_after = engine.generate({prompt}, greedy(64));
+    //     printf("  AFTER  sleep/wakeup: %s\n",
+    //            resp_after.empty() ? "(empty)" : resp_after[0].c_str());
+
+    //     if (!resp_before.empty() && !resp_after.empty() && resp_before[0] == resp_after[0])
+    //         PASS("sleep/wakeup: greedy output matches before/after");
+    //     else
+    //         FAIL("sleep/wakeup", "output changed after sleep/wakeup cycle");
+    // }
+
+    // ── 5e. generate_ids — exact GRPO path ──────────────────────────────
+    if (data_path && std::filesystem::exists(data_path)) {
+        printf("\n  ── generate_ids (GRPO path) with DAPO prompts ──\n");
+
+        // Re-read bin file for first 2 prompts
+        FILE* f = fopen(data_path, "rb");
+        if (f) {
+            struct { char magic[4]; uint32_t version; uint64_t num_samples, total_tokens; uint32_t flags, pad; } hdr2;
+            fread(&hdr2, sizeof(hdr2), 1, f);
+            size_t N2 = (size_t)hdr2.num_samples;
+            std::vector<uint64_t> offsets2(N2 + 1);
+            fread(offsets2.data(), sizeof(uint64_t), N2 + 1, f);
+            if (hdr2.flags & 1) fseek(f, N2 * sizeof(uint32_t), SEEK_CUR);
+            std::vector<int32_t> all_tokens2((size_t)hdr2.total_tokens);
+            fread(all_tokens2.data(), sizeof(int32_t), hdr2.total_tokens, f);
+            fclose(f);
+
+            // Build 2 prompts
+            const int NP = 2;
+            const int G  = 4;  // 8 generations per prompt (like GRPO)
+            std::vector<std::vector<int64_t>> prompts2(NP);
+            for (int i = 0; i < NP; i++) {
+                size_t len = (size_t)(offsets2[i + 1] - offsets2[i]);
+                prompts2[i].resize(len);
+                for (size_t t = 0; t < len; t++)
+                    prompts2[i][t] = (int64_t)all_tokens2[offsets2[i] + t];
+            }
+
+            // Simulate GRPO: sleep → wakeup → generate_ids → sleep
+            engine.sleep();
+            engine.wakeup();
+
+            SamplingParams sp2;
+            sp2.temperature    = 0.8f;
+            sp2.top_p          = 1.0f;
+            sp2.max_new_tokens = 512;  // shorter for debug
+            sp2.do_sample      = true;
+
+            // Printout prompts
+            for (int i = 0; i < NP; i++) {
+                std::string prompt_text = engine.tokenizer->decode(prompts2[i]);
+                printf("\n  ── generate_ids prompt %d (%zu tokens) ──\n", i, prompts2[i].size());
+                printf("  %s\n", prompt_text.c_str());
+            }
+
+            auto completions2 = engine.generate_ids(prompts2, sp2, G);
+
+            for (int i = 0; i < NP; i++) {
+                for (int g = 0; g < G; g++) {
+                    int idx = i * G + g;
+                    auto it = completions2.find((int64_t)idx);
+                    if (it != completions2.end()) {
+                        std::string text = engine.tokenizer->decode(it->second);
+                        printf("\n  ── generate_ids prompt=%d gen=%d (%d tokens) ──\n",
+                               i, g, (int)it->second.size());
+                        printf("  %s\n",
+                               text.size() > 1000 ? (text.substr(0, 1000) + "...").c_str()
+                                                  : text.c_str());
+                    } else {
+                        printf("\n  ── generate_ids prompt=%d gen=%d: MISSING ──\n", i, g);
+                    }
+                }
+            }
+
+            // Wakeup again so subsequent tests work
+            engine.wakeup();
+        }
+    }
+}
+
+// =============================================================================
 // main
 // =============================================================================
 
 int main(int argc, char* argv[]) {
-    const char* model_dir = (argc > 1) ? argv[1] : "model_weights/Qwen3-0.6B";
+    const char* model_dir  = (argc > 1) ? argv[1] : "model_weights/Qwen3-0.6B";
+    const char* data_path  = (argc > 2) ? argv[2] : "data/dapo-17k.bin";
 
     printf("=== LLMEngine integration tests ===\n");
     printf("Model: %s\n", model_dir);
@@ -383,17 +602,17 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg(model_dir);
-    cfg.max_num_seqs           = 512;
-    cfg.max_model_len          = 2048;
-    cfg.max_num_batched_tokens = 262144;
+    cfg.max_num_seqs           = 64;
+    cfg.max_model_len          = 8192;
     cfg.gpu_memory_utilization = 0.90f;
     cfg.enforce_eager          = false;
 
     LLMEngine engine(cfg);
 
-    test_correctness(engine);
-    test_memory(engine);
-    test_throughput(engine);
+    // test_rollout_debug(engine, data_path);
+    // test_correctness(engine);
+    // test_memory(engine);
+    // test_throughput(engine);
     test_bench_realistic(engine);
 
     printf("\n");

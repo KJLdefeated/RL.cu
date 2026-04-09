@@ -26,7 +26,6 @@ using namespace nvcuda;
 // =============================================================================
 
 static constexpr int WARP_SIZE        = 32;
-static constexpr int DIMS_PER_THREAD  = 4;   // HEAD_DIM(128) / WARP_SIZE(32)
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll

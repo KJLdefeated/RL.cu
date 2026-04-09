@@ -11,6 +11,7 @@ class Scheduler {
 private:
     int max_num_seqs;
     int max_num_batched_tokens;
+    int max_model_len;
     int64_t eos;
     BlockManager block_manager;
     std::deque<Sequence*> waiting;
@@ -30,6 +31,7 @@ public:
     Scheduler(const Config& cfg)
         : max_num_seqs(cfg.max_num_seqs),
           max_num_batched_tokens(cfg.max_num_batched_tokens),
+          max_model_len(cfg.max_model_len),
           eos(cfg.eos),
           block_manager(cfg.num_kv_blocks, cfg.kv_block_size),
           slot_used(cfg.max_num_seqs, false) {}
@@ -67,7 +69,8 @@ public:
             seq->append_token(new_token_id);
             block_manager.may_append(*seq);
 
-            bool max_len_reached = (seq->num_tokens - seq->num_prompt_tokens) >= max_new_tokens;
+            bool max_len_reached = (seq->num_tokens - seq->num_prompt_tokens) >= max_new_tokens
+                                || seq->num_tokens >= max_model_len;
             if ((!seq->sampling_params.ignore_eos && new_token_id == eos) || max_len_reached) {
                 seq->status = SeqStatus::FINISHED;
                 block_manager.deallocate(*seq);
@@ -124,12 +127,16 @@ public:
 
         std::vector<Sequence*> scheduled;
         int num_batched_tokens = 0;
+        int max_seq_in_batch   = 0;  // track S_max for padded size check
         int prefill_blks_rsvd  = 0;  // post-prefill may_append blocks reserved
         while (!waiting.empty() && (int)scheduled.size() < available_slots) {
             Sequence* seq = waiting.front();
             int uncached = seq->size() - seq->num_cached_tokens;
             int needs_postprefill = (seq->size() % seq->block_size == 0) ? 1 : 0;
-            if (num_batched_tokens + uncached > max_num_batched_tokens ||
+            // Check padded size: qwen3_prefill pads to B * S_max
+            int new_smax = std::max(max_seq_in_batch, uncached);
+            int padded_tokens = ((int)scheduled.size() + 1) * new_smax;
+            if (padded_tokens > max_num_batched_tokens ||
                 !block_manager.can_allocate(*seq) ||
                 block_manager.num_free_blocks()
                     - (int)seq->num_blocks()
@@ -144,6 +151,7 @@ public:
             running.push_back(seq);
             scheduled.push_back(seq);
             num_batched_tokens += uncached;
+            max_seq_in_batch    = new_smax;
         }
         return scheduled;
     }

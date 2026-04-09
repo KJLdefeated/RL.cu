@@ -156,13 +156,16 @@ __global__ static void scale_float_kernel(float* __restrict__ g, float scale, in
 // =============================================================================
 class Trainer {
 public:
-    Trainer(const TrainingConfig& config, Qwen3Model* model)
+    Trainer(const TrainingConfig& config, Qwen3Model* model,
+            bool load_data = true)
         : model_(model),
           optimizer_(model, config.base_lr, config.beta1, config.beta2,
                      config.opt_eps, config.weight_decay),
           // DataLoader uses global_batch_size so each next_batch() call
           // returns one full accumulation window worth of samples.
-          data_loader_(config.train_data_path, config.global_batch_size, config.max_seq_len),
+          data_loader_(load_data
+              ? DataLoader(config.train_data_path, config.global_batch_size, config.max_seq_len)
+              : DataLoader()),
           logger_(config.save_dir),
           config_(config)
     {
@@ -204,6 +207,7 @@ public:
                 // Accumulate metrics into logger
                 logger_.log(global_step, "loss",        loss);
                 logger_.log(global_step, "lr",          cur_lr);
+                logger_.log(global_step, "grad_norm",   last_grad_norm_);
                 logger_.log(global_step, "step_ms",     step_ms);
                 logger_.log(global_step, "tok_per_sec", tok_per_sec);
 
@@ -273,13 +277,15 @@ public:
         }
 
         // Gradient clipping: scale all gradients so global L2 norm <= max_grad_norm.
+        float grad_norm = 0.0f;
         if (config_.max_grad_norm > 0.0f) {
-            clip_grad_norm_(grads_, config_.max_grad_norm);
+            grad_norm = clip_grad_norm_(grads_, config_.max_grad_norm);
         }
 
         // One optimizer step after all micro-batches
         optimizer_.step(grads_);
 
+        last_grad_norm_ = grad_norm;
         return accum_loss / acc_steps;
     }
 
@@ -299,6 +305,7 @@ protected:
     int*             d_loss_mask_  = nullptr;  // [micro_T]
     int              buf_B_ = 0, buf_S_ = 0;
     float*           d_norm_acc_ = nullptr; // [1] device scalar for grad norm accumulation
+    float            last_grad_norm_ = 0.0f;
 
     // Subclass implements: compute loss on one micro-batch, write gradient into d_loss_grad_.
     // Do NOT scale by grad_accum_steps — the base class handles that.
@@ -344,7 +351,6 @@ protected:
         return total_norm;
     }
 
-private:
     // Lazy-allocate / reallocate GPU buffers when micro-batch shape changes
     void ensure_buffers(int B, int S) {
         if (state_ && buf_B_ == B && buf_S_ == S) return;

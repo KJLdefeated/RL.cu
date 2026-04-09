@@ -10,6 +10,7 @@
 #include "kernels/swiglu.cuh"
 #include "kernels/linear.cuh"
 #include "kernels/adamw.cuh"
+#include "kernels/fused_norm_linear.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -254,8 +255,6 @@ void qwen3_layer_forward(
                                cudaMemcpyDeviceToDevice, stream));
     launch_rmsnorm(m->d_hidden, m->d_residual, L.input_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
     // QKV projections — separate GEMMs so Q[T,q_dim], K[T,kv_dim], V[T,kv_dim]
-    // are each packed contiguously (fused output is interleaved [Q[t]|K[t]|V[t]]
-    // which would mismatch the packed alias pointers for T>1).
     linear_half(m->cublas, m->d_hidden, L.q_proj, m->d_Q, T, c.q_dim,  c.hidden_size, stream);
     linear_half(m->cublas, m->d_hidden, L.k_proj, m->d_K, T, c.kv_dim, c.hidden_size, stream);
     linear_half(m->cublas, m->d_hidden, L.v_proj, m->d_V, T, c.kv_dim, c.hidden_size, stream);
@@ -304,8 +303,6 @@ void qwen3_layer_forward(
                                cudaMemcpyDeviceToDevice, stream));
     launch_rmsnorm(m->d_hidden, m->d_residual,
                    L.post_attn_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
-
-    // Gate + up projections — separate GEMMs (same interleaving issue as QKV for T>1)
     linear_half(m->cublas, m->d_hidden, L.gate_proj,
                 m->d_gate, T, c.intermediate_size, c.hidden_size, stream);
     linear_half(m->cublas, m->d_hidden, L.up_proj,
@@ -360,19 +357,15 @@ Qwen3Model* qwen3_load(const std::string& model_dir, int max_batch, int max_seq)
                            c.max_position_embeddings, c.head_dim, c.rope_theta);
 
     // Scratch buffers
-    CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size       * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size       * sizeof(half)));
-    // Fused QKV: single allocation, Q/K/V are aliases
-    CUDA_CHECK(cudaMalloc(&m->d_qkv,      (long)max_T * (c.q_dim + 2*c.kv_dim) * sizeof(half)));
-    m->d_Q = m->d_qkv;
-    m->d_K = m->d_qkv + (long)max_T * c.q_dim;
-    m->d_V = m->d_qkv + (long)max_T * (c.q_dim + c.kv_dim);
-    CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim             * sizeof(half)));
-    // Fused gate+up: single allocation, gate/up are aliases
-    CUDA_CHECK(cudaMalloc(&m->d_gate_up,  (long)max_T * 2*c.intermediate_size * sizeof(half)));
-    m->d_gate = m->d_gate_up;
-    m->d_up   = m->d_gate_up + (long)max_T * c.intermediate_size;
-    CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size         * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size         * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_Q,        (long)max_T * c.q_dim               * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_K,        (long)max_T * c.kv_dim              * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_V,        (long)max_T * c.kv_dim              * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim               * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_gate,     (long)max_T * c.intermediate_size   * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_up,       (long)max_T * c.intermediate_size   * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size   * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_logits,   (long)max_batch * c.vocab_size    * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
@@ -415,21 +408,19 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
 
     const Qwen3Config& c = m->config;
     const int max_T = max_batched_tokens;  // ← scratch sizing
+    m->max_T = max_T;
+    m->infer_max_T = max_T;
 
     // Scratch buffers (using max_T, not max_batch × max_seq)
-    CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size       * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size       * sizeof(half)));
-    // Fused QKV: single allocation, Q/K/V are aliases
-    CUDA_CHECK(cudaMalloc(&m->d_qkv,      (long)max_T * (c.q_dim + 2*c.kv_dim) * sizeof(half)));
-    m->d_Q = m->d_qkv;
-    m->d_K = m->d_qkv + (long)max_T * c.q_dim;
-    m->d_V = m->d_qkv + (long)max_T * (c.q_dim + c.kv_dim);
-    CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim             * sizeof(half)));
-    // Fused gate+up: single allocation, gate/up are aliases
-    CUDA_CHECK(cudaMalloc(&m->d_gate_up,  (long)max_T * 2*c.intermediate_size * sizeof(half)));
-    m->d_gate = m->d_gate_up;
-    m->d_up   = m->d_gate_up + (long)max_T * c.intermediate_size;
-    CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)max_T * c.hidden_size         * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_residual, (long)max_T * c.hidden_size         * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_Q,        (long)max_T * c.q_dim               * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_K,        (long)max_T * c.kv_dim              * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_V,        (long)max_T * c.kv_dim              * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)max_T * c.q_dim               * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_gate,     (long)max_T * c.intermediate_size   * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_up,       (long)max_T * c.intermediate_size   * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)max_T * c.intermediate_size   * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_logits,   (long)max_batch * c.vocab_size    * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
@@ -475,6 +466,34 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
            (total_blocks * block_bytes) / (1024.0*1024*1024));
 }
 
+// Re-allocate scratch buffers to exactly T tokens.
+// Grows for training forward, shrinks on wakeup to reclaim memory for KV cache.
+void qwen3_ensure_scratch(Qwen3Model* m, int T) {
+    if (T == m->max_T) return;
+
+    const Qwen3Config& c = m->config;
+    printf("[Qwen3] Resizing scratch: %d → %d tokens\n", m->max_T, T);
+
+    // Free old scratch
+    cudaFree(m->d_hidden);   cudaFree(m->d_residual);
+    cudaFree(m->d_Q);        cudaFree(m->d_K);        cudaFree(m->d_V);
+    cudaFree(m->d_attn_out); cudaFree(m->d_gate);
+    cudaFree(m->d_up);       cudaFree(m->d_mlp_mid);
+
+    // Re-allocate with new size
+    CUDA_CHECK(cudaMalloc(&m->d_hidden,   (long)T * c.hidden_size       * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_residual, (long)T * c.hidden_size       * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_Q,        (long)T * c.q_dim             * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_K,        (long)T * c.kv_dim            * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_V,        (long)T * c.kv_dim            * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_attn_out, (long)T * c.q_dim             * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_gate,     (long)T * c.intermediate_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_up,       (long)T * c.intermediate_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&m->d_mlp_mid,  (long)T * c.intermediate_size * sizeof(half)));
+
+    m->max_T = T;
+}
+
 void qwen3_free(Qwen3Model* m) {
     if (!m) return;
     free_weights(m->weights);
@@ -482,8 +501,9 @@ void qwen3_free(Qwen3Model* m) {
     if (m->cublas) cublasDestroy(m->cublas);
     cudaFree(m->cos_table);   cudaFree(m->sin_table);
     cudaFree(m->d_hidden);    cudaFree(m->d_residual);
-    cudaFree(m->d_qkv);       cudaFree(m->d_attn_out);
-    cudaFree(m->d_gate_up);
+    cudaFree(m->d_Q);         cudaFree(m->d_K);         cudaFree(m->d_V);
+    cudaFree(m->d_attn_out);
+    cudaFree(m->d_gate);      cudaFree(m->d_up);
     cudaFree(m->d_mlp_mid);   cudaFree(m->d_logits);
     cudaFree(m->d_pos_ids);   cudaFree(m->d_slot_map);
     cudaFree(m->d_tokens);
@@ -506,6 +526,47 @@ void qwen3_reset(Qwen3Model* m) {
     memset(m->h_seq_lens,      0, (long)m->max_batch * sizeof(int));
     CUDA_CHECK(cudaMemcpy(m->kv_cache.block_tables, m->h_block_tables, (long)m->max_batch * mbps * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(m->kv_cache.seq_lens, m->h_seq_lens, (long)m->max_batch * sizeof(int), cudaMemcpyHostToDevice));
+}
+
+// ---------------------------------------------------------------------------
+// Sleep / Wakeup — free and re-allocate KV cache pools
+// ---------------------------------------------------------------------------
+
+void qwen3_sleep(Qwen3Model* m) {
+    paged_kv_cache_free(m->kv_cache);
+    m->kv_cache.k_pool = nullptr;
+    m->kv_cache.v_pool = nullptr;
+    m->kv_cache.block_tables = nullptr;
+    m->kv_cache.seq_lens = nullptr;
+    m->kv_cache.free_stack = nullptr;
+    m->total_kv_blocks = 0;
+}
+
+void qwen3_wakeup(Qwen3Model* m, int total_blocks) {
+    // Shrink scratch back to inference size to free memory for KV cache
+    if (m->max_T > m->infer_max_T)
+        qwen3_ensure_scratch(m, m->infer_max_T);
+
+    const Qwen3Config& c = m->config;
+    int max_blocks_per_seq = (m->max_seq + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE + 2;
+    m->kv_cache = paged_kv_cache_init(
+        c.num_hidden_layers, c.num_key_value_heads, c.head_dim,
+        total_blocks, m->max_batch, max_blocks_per_seq);
+    m->total_kv_blocks = total_blocks;
+
+    // Reset host mirrors
+    int mbps = m->kv_cache.max_blocks_per_seq;
+    memset(m->h_block_tables, -1, (long)m->max_batch * mbps * sizeof(int));
+    memset(m->h_seq_lens,      0, m->max_batch * sizeof(int));
+    CUDA_CHECK(cudaMemcpy(m->kv_cache.block_tables, m->h_block_tables,
+                          (long)m->max_batch * mbps * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(m->kv_cache.seq_lens, m->h_seq_lens,
+                          m->max_batch * sizeof(int), cudaMemcpyHostToDevice));
+
+    size_t block_bytes = 2ULL * c.num_hidden_layers * KV_BLOCK_SIZE
+                       * c.num_key_value_heads * c.head_dim * sizeof(half);
+    printf("[WAKEUP] KV pool=%d blocks (%.1f GB)\n",
+           total_blocks, (total_blocks * block_bytes) / (1024.0*1024*1024));
 }
 
 // Free KV blocks for a finished sequence at batch slot b; reset its state.
@@ -727,97 +788,82 @@ Qwen3TrainState* qwen3_train_state_alloc(const Qwen3Config& c, int B, int S) {
     const int T = s->T;
     const int L = s->num_layers;
 
-    // Per-layer element counts (half)
-    const long input_sz = (long)T * c.hidden_size;
-    const long qraw_sz  = (long)T * c.q_dim;
-    const long kraw_sz  = (long)T * c.kv_dim;
-    const long q_sz     = (long)T * c.q_dim;
-    const long k_sz     = (long)T * c.kv_dim;
-    const long v_sz     = (long)T * c.kv_dim;
-    const long o_sz     = (long)T * c.q_dim;
-    const long pattn_sz = (long)T * c.hidden_size;
-    const long gate_sz  = (long)T * c.intermediate_size;
-    const long up_sz    = (long)T * c.intermediate_size;
+    // ── Checkpoint pool: only layer_input[L] + final_hidden ──
+    const long input_sz = (long)T * c.hidden_size;   // per layer
     const long final_sz = (long)T * c.hidden_size;
+    const long ckpt_halfs = input_sz * L + final_sz;
 
-    const long per_layer_halfs = input_sz + qraw_sz + kraw_sz + q_sz + k_sz
-                               + v_sz + o_sz + pattn_sz + gate_sz + up_sz;
-    const long total_halfs = per_layer_halfs * L + final_sz;
-
-    // Per-layer element counts (float) — LSE: [B, S, H_q] = [T, H_q]
+    // ── LSE pool: [L × T × H_q] ──
     const long lse_per_layer = (long)T * c.num_attention_heads;
     const long total_floats  = lse_per_layer * L;
 
+    // ── Recomputation pool: single-layer scratch for backward ──
+    // Q_raw + K_raw + Q + K + V + O + post_attn + gate + up
+    const long recomp_halfs = (long)T * (c.q_dim + c.kv_dim        // Q_raw, K_raw
+                                       + c.q_dim + c.kv_dim        // Q, K
+                                       + c.kv_dim                  // V
+                                       + c.q_dim                   // O
+                                       + c.hidden_size             // post_attn
+                                       + c.intermediate_size       // gate
+                                       + c.intermediate_size);     // up
+
     // Allocate GPU pools
-    CUDA_CHECK(cudaMalloc(&s->activation_pool, total_halfs * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&s->checkpoint_pool, ckpt_halfs * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&s->lse_pool, total_floats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s->recomp_pool, recomp_halfs * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&s->d_logits_train,
                           (long)TRAIN_LOGITS_CHUNK * c.vocab_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&s->d_token_ids,  T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_target_ids, T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_pos_ids,    T * sizeof(int)));
 
-    // Allocate host pointer arrays
-    s->layer_input     = new half*[L];
-    s->layer_Q_raw     = new half*[L];
-    s->layer_K_raw     = new half*[L];
-    s->layer_Q         = new half*[L];
-    s->layer_K         = new half*[L];
-    s->layer_V         = new half*[L];
-    s->layer_O         = new half*[L];
-    s->layer_post_attn = new half*[L];
-    s->layer_gate      = new half*[L];
-    s->layer_up        = new half*[L];
-    s->layer_lse       = new float*[L];
-
-    // Partition half pool into per-layer buffers
-    half* p = s->activation_pool;
+    // Partition checkpoint pool
+    s->layer_input = new half*[L];
+    half* p = s->checkpoint_pool;
     for (int l = 0; l < L; l++) {
-        s->layer_input[l]     = p;  p += input_sz;
-        s->layer_Q_raw[l]     = p;  p += qraw_sz;
-        s->layer_K_raw[l]     = p;  p += kraw_sz;
-        s->layer_Q[l]         = p;  p += q_sz;
-        s->layer_K[l]         = p;  p += k_sz;
-        s->layer_V[l]         = p;  p += v_sz;
-        s->layer_O[l]         = p;  p += o_sz;
-        s->layer_post_attn[l] = p;  p += pattn_sz;
-        s->layer_gate[l]      = p;  p += gate_sz;
-        s->layer_up[l]        = p;  p += up_sz;
+        s->layer_input[l] = p;  p += input_sz;
     }
-    s->final_hidden = p;  // last chunk: [T, hidden]
+    s->final_hidden = p;  // [T, hidden]
 
-    // Partition float pool into per-layer LSE
+    // Partition LSE pool
+    s->layer_lse = new float*[L];
     float* fp = s->lse_pool;
     for (int l = 0; l < L; l++) {
         s->layer_lse[l] = fp;  fp += lse_per_layer;
     }
 
-    printf("[TrainState] Allocated: B=%d S=%d T=%d  activations=%.1f MB  LSE=%.2f MB\n",
-           B, S, T,
-           total_halfs * sizeof(half) / (1024.0 * 1024.0),
-           total_floats * sizeof(float) / (1024.0 * 1024.0));
+    // Partition recomputation pool (single-layer buffers)
+    half* rp = s->recomp_pool;
+    s->recomp_Q_raw     = rp;  rp += (long)T * c.q_dim;
+    s->recomp_K_raw     = rp;  rp += (long)T * c.kv_dim;
+    s->recomp_Q         = rp;  rp += (long)T * c.q_dim;
+    s->recomp_K         = rp;  rp += (long)T * c.kv_dim;
+    s->recomp_V         = rp;  rp += (long)T * c.kv_dim;
+    s->recomp_O         = rp;  rp += (long)T * c.q_dim;
+    s->recomp_post_attn = rp;  rp += (long)T * c.hidden_size;
+    s->recomp_gate      = rp;  rp += (long)T * c.intermediate_size;
+    s->recomp_up        = rp;  rp += (long)T * c.intermediate_size;
+
+    printf("[TrainState] Gradient checkpointing: ckpt=%.1f MB  recomp=%.1f MB  "
+           "LSE=%.1f MB  (saved %.1f GB vs full)\n",
+           ckpt_halfs * 2.0 / (1024*1024),
+           recomp_halfs * 2.0 / (1024*1024),
+           total_floats * 4.0 / (1024*1024),
+           ((long)T * 16384L * 2 * L - ckpt_halfs * 2 - recomp_halfs * 2) / (1024.0*1024*1024));
 
     return s;
 }
 
 void qwen3_train_state_free(Qwen3TrainState* s) {
     if (!s) return;
-    cudaFree(s->activation_pool);
+    cudaFree(s->checkpoint_pool);
     cudaFree(s->lse_pool);
+    cudaFree(s->recomp_pool);
     cudaFree(s->d_logits_train);
     cudaFree(s->d_token_ids);
     cudaFree(s->d_target_ids);
     cudaFree(s->d_pos_ids);
     delete[] s->layer_input;
-    delete[] s->layer_Q_raw;
-    delete[] s->layer_K_raw;
-    delete[] s->layer_Q;
-    delete[] s->layer_K;
-    delete[] s->layer_V;
-    delete[] s->layer_O;
-    delete[] s->layer_post_attn;
-    delete[] s->layer_gate;
-    delete[] s->layer_up;
     delete[] s->layer_lse;
     delete s;
 }
@@ -838,6 +884,9 @@ void qwen3_forward(
     const Qwen3Config& c = m->config;
     const int T = B * S;
     state->B = B;  state->S = S;  state->T = T;
+
+    // Ensure scratch buffers are large enough for training batch
+    if (T > m->max_T) qwen3_ensure_scratch(m, T);
 
     // --- Upload token IDs, target IDs, position IDs ---
     CUDA_CHECK(cudaMemcpyAsync(state->d_token_ids, h_token_ids,
@@ -861,73 +910,73 @@ void qwen3_forward(
     launch_embedding(m->d_hidden, m->weights.embed_tokens,
                      state->d_token_ids, T, c.vocab_size, c.hidden_size, stream);
 
-    // --- Transformer layers ---
+    // --- Transformer layers (gradient checkpointing: only save residuals + LSE) ---
     for (int l = 0; l < c.num_hidden_layers; l++) {
         const Qwen3LayerWeights& L = m->weights.layers[l];
 
-        // Save input hidden state (= residual for this layer)
+        // CHECKPOINT: save input residual
         CUDA_CHECK(cudaMemcpyAsync(state->layer_input[l], m->d_hidden,
                                    (long)T * c.hidden_size * sizeof(half),
                                    cudaMemcpyDeviceToDevice, stream));
 
-        // Input RMSNorm: d_hidden = norm(layer_input)
+        // Input RMSNorm
         launch_rmsnorm(m->d_hidden, state->layer_input[l],
                        L.input_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
 
-        // QKV projections → save raw Q, K into state; V directly into state
+        // QKV projections → scratch (not saved)
         linear_half(m->cublas, m->d_hidden, L.q_proj,
-                    state->layer_Q_raw[l], T, c.q_dim, c.hidden_size, stream);
+                    m->d_Q, T, c.q_dim, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.k_proj,
-                    state->layer_K_raw[l], T, c.kv_dim, c.hidden_size, stream);
+                    m->d_K, T, c.kv_dim, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.v_proj,
-                    state->layer_V[l],     T, c.kv_dim, c.hidden_size, stream);
+                    m->d_V, T, c.kv_dim, c.hidden_size, stream);
 
-        // QK-Norm: Q_raw → Q, K_raw → K  (separate in/out, no copy needed)
-        launch_rmsnorm(state->layer_Q[l], state->layer_Q_raw[l],
+        // QK-Norm
+        launch_rmsnorm(m->d_attn_out, m->d_Q,
                        L.q_norm, T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
-        launch_rmsnorm(state->layer_K[l], state->layer_K_raw[l],
+        launch_rmsnorm(m->d_residual, m->d_K,
                        L.k_norm, T * c.num_key_value_heads, c.head_dim, c.rms_norm_eps, stream);
 
-        // RoPE in-place on Q, K (state buffers)
-        launch_rope(state->layer_Q[l], state->layer_K[l],
+        // RoPE in-place
+        launch_rope(m->d_attn_out, m->d_residual,
                     m->cos_table, m->sin_table, state->d_pos_ids,
                     T, c.num_attention_heads, c.num_key_value_heads, c.head_dim, stream);
 
-        // Flash Attention 2 prefill (no KV cache) — saves LSE for backward
+        // Flash Attention 2 — CHECKPOINT: save LSE for backward
         launch_flash_attention_prefill(
-            state->layer_Q[l], state->layer_K[l], state->layer_V[l],
-            state->layer_O[l],
+            m->d_attn_out, m->d_residual, m->d_V,
+            m->d_Q,  // reuse d_Q as attention output (Q no longer needed)
             B, S, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
             stream, state->layer_lse[l]);
 
         // O projection + residual
-        linear_half(m->cublas, state->layer_O[l], L.o_proj,
+        linear_half(m->cublas, m->d_Q, L.o_proj,
                     m->d_hidden, T, c.hidden_size, c.q_dim, stream);
         add_residual(m->d_hidden, state->layer_input[l], T * c.hidden_size, stream);
 
-        // Save post-attention hidden (residual for MLP block)
-        CUDA_CHECK(cudaMemcpyAsync(state->layer_post_attn[l], m->d_hidden,
+        // Save post-attention residual → d_residual (scratch, used immediately)
+        CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden,
                                    (long)T * c.hidden_size * sizeof(half),
                                    cudaMemcpyDeviceToDevice, stream));
 
         // Post-attention RMSNorm
-        launch_rmsnorm(m->d_hidden, state->layer_post_attn[l],
+        launch_rmsnorm(m->d_hidden, m->d_residual,
                        L.post_attn_layernorm, T, c.hidden_size, c.rms_norm_eps, stream);
 
-        // Gate/Up projections → save into state
+        // Gate/Up projections → scratch
         linear_half(m->cublas, m->d_hidden, L.gate_proj,
-                    state->layer_gate[l], T, c.intermediate_size, c.hidden_size, stream);
+                    m->d_gate, T, c.intermediate_size, c.hidden_size, stream);
         linear_half(m->cublas, m->d_hidden, L.up_proj,
-                    state->layer_up[l],   T, c.intermediate_size, c.hidden_size, stream);
+                    m->d_up, T, c.intermediate_size, c.hidden_size, stream);
 
-        // SwiGLU → scratch d_mlp_mid (not saved; recomputable from gate+up)
-        launch_swiglu(m->d_mlp_mid, state->layer_gate[l], state->layer_up[l],
+        // SwiGLU
+        launch_swiglu(m->d_mlp_mid, m->d_gate, m->d_up,
                       T * c.intermediate_size, stream);
 
         // Down projection + residual
         linear_half(m->cublas, m->d_mlp_mid, L.down_proj,
                     m->d_hidden, T, c.hidden_size, c.intermediate_size, stream);
-        add_residual(m->d_hidden, state->layer_post_attn[l], T * c.hidden_size, stream);
+        add_residual(m->d_hidden, m->d_residual, T * c.hidden_size, stream);
     }
 
     // --- Save final hidden state (before final_norm) ---
@@ -1032,9 +1081,9 @@ Qwen3Gradients* qwen3_gradients_alloc(const Qwen3Config& c, int max_T) {
     g->dW_final_norm = fp; fp += final_norm_sz;
     g->D_buf         = fp;
 
-    printf("[Gradients] Allocated: half=%.1f MB  float=%.2f MB\n",
-           g->half_pool_bytes / (1024.0 * 1024.0),
-           g->float_pool_bytes / (1024.0 * 1024.0));
+    // printf("[Gradients] Allocated: half=%.1f MB  float=%.2f MB\n",
+    //        g->half_pool_bytes / (1024.0 * 1024.0),
+    //        g->float_pool_bytes / (1024.0 * 1024.0));
 
     return g;
 }
@@ -1144,6 +1193,61 @@ void qwen3_backward(
     for (int l = c.num_hidden_layers - 1; l >= 0; l--) {
         const Qwen3LayerWeights& LW = m->weights.layers[l];
 
+        // ==============================================================
+        // RECOMPUTE forward for layer l from saved layer_input[l]
+        // Results go into state->recomp_* buffers
+        // ==============================================================
+        {
+            // Input RMSNorm → d_gate (scratch, will be reused below)
+            launch_rmsnorm(m->d_gate, state->layer_input[l],
+                           LW.input_layernorm, T, H, c.rms_norm_eps, stream);
+
+            // QKV projections
+            linear_half(m->cublas, m->d_gate, LW.q_proj,
+                        state->recomp_Q_raw, T, c.q_dim, H, stream);
+            linear_half(m->cublas, m->d_gate, LW.k_proj,
+                        state->recomp_K_raw, T, c.kv_dim, H, stream);
+            linear_half(m->cublas, m->d_gate, LW.v_proj,
+                        state->recomp_V,     T, c.kv_dim, H, stream);
+
+            // QK-Norm
+            launch_rmsnorm(state->recomp_Q, state->recomp_Q_raw,
+                           LW.q_norm, T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
+            launch_rmsnorm(state->recomp_K, state->recomp_K_raw,
+                           LW.k_norm, T * c.num_key_value_heads, c.head_dim, c.rms_norm_eps, stream);
+
+            // RoPE in-place
+            launch_rope(state->recomp_Q, state->recomp_K,
+                        m->cos_table, m->sin_table, state->d_pos_ids,
+                        T, c.num_attention_heads, c.num_key_value_heads, c.head_dim, stream);
+
+            // Flash Attention (recompute O; LSE already saved, pass nullptr to skip)
+            launch_flash_attention_prefill(
+                state->recomp_Q, state->recomp_K, state->recomp_V,
+                state->recomp_O,
+                B, S, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                stream, nullptr);  // don't overwrite saved LSE
+
+            // O proj + residual → recomp_post_attn
+            linear_half(m->cublas, state->recomp_O, LW.o_proj,
+                        state->recomp_post_attn, T, H, c.q_dim, stream);
+            add_residual(state->recomp_post_attn, state->layer_input[l], T * H, stream);
+
+            // Post-attn norm → d_gate (scratch, reused for gate/up below)
+            launch_rmsnorm(m->d_gate, state->recomp_post_attn,
+                           LW.post_attn_layernorm, T, H, c.rms_norm_eps, stream);
+
+            // Gate/Up projections
+            linear_half(m->cublas, m->d_gate, LW.gate_proj,
+                        state->recomp_gate, T, c.intermediate_size, H, stream);
+            linear_half(m->cublas, m->d_gate, LW.up_proj,
+                        state->recomp_up,   T, c.intermediate_size, H, stream);
+        }
+
+        // ==============================================================
+        // BACKWARD for layer l (same logic, using recomp_* instead of saved)
+        // ==============================================================
+
         // Save d_output for residual path
         CUDA_CHECK(cudaMemcpyAsync(m->d_residual, m->d_hidden,
                                    (long)T * H * sizeof(half),
@@ -1151,8 +1255,8 @@ void qwen3_backward(
 
         // ---- MLP backward ----
 
-        // Recompute mlp_mid = swiglu(gate[l], up[l])
-        launch_swiglu(m->d_mlp_mid, state->layer_gate[l], state->layer_up[l],
+        // Recompute mlp_mid = swiglu(gate, up)
+        launch_swiglu(m->d_mlp_mid, state->recomp_gate, state->recomp_up,
                       T * c.intermediate_size, stream);
 
         // down_proj backward
@@ -1164,20 +1268,20 @@ void qwen3_backward(
             grads->dW_down_proj[l],             // dW [H, inter]
             T, H, c.intermediate_size);
 
-        // SwiGLU backward: dOut=d_up → dGate=d_gate, dUp=d_mlp_mid
+        // SwiGLU backward
         launch_swiglu_backward(
             m->d_gate,                          // dGate [T, inter]
             m->d_mlp_mid,                       // dUp   [T, inter]
             m->d_up,                            // dOut  [T, inter]
-            state->layer_gate[l],               // saved gate
-            state->layer_up[l],                 // saved up
+            state->recomp_gate,                 // recomputed gate
+            state->recomp_up,                   // recomputed up
             T * c.intermediate_size, stream);
 
-        // Recompute normed post_attn → d_K (scratch [T, H]; kv_dim=H)
-        launch_rmsnorm(m->d_K, state->layer_post_attn[l],
+        // Recompute normed post_attn → d_K (scratch)
+        launch_rmsnorm(m->d_K, state->recomp_post_attn,
                        LW.post_attn_layernorm, T, H, c.rms_norm_eps, stream);
 
-        // gate_proj backward: dX → d_Q
+        // gate_proj backward
         linear_backward_half(m->cublas,
             m->d_gate,                          // dY [T, inter]
             m->d_K,                             // X  [T, H] (normed post_attn)
@@ -1186,7 +1290,7 @@ void qwen3_backward(
             grads->dW_gate_proj[l],             // dW [inter, H]
             T, c.intermediate_size, H);
 
-        // up_proj backward: dX → d_V
+        // up_proj backward
         linear_backward_half(m->cublas,
             m->d_mlp_mid,                       // dY [T, inter] (=dUp)
             m->d_K,                             // X  [T, H]
@@ -1206,7 +1310,7 @@ void qwen3_backward(
             m->d_Q,                             // dX [T, H]
             grads->dW_post_attn_norm[l],        // dW [H]
             m->d_hidden,                        // dY [T, H]
-            state->layer_post_attn[l],          // x  [T, H]
+            state->recomp_post_attn,            // x  [T, H] (recomputed)
             LW.post_attn_layernorm,             // w  [H]
             T, H, c.rms_norm_eps, stream);
 
@@ -1220,10 +1324,10 @@ void qwen3_backward(
                                    (long)T * H * sizeof(half),
                                    cudaMemcpyDeviceToDevice, stream));
 
-        // o_proj backward: dX → d_attn_out (= dO for flash attention)
+        // o_proj backward
         linear_backward_half(m->cublas,
             m->d_Q,                             // dY [T, H]
-            state->layer_O[l],                  // X  [T, q_dim]
+            state->recomp_O,                    // X  [T, q_dim] (recomputed)
             LW.o_proj,                          // W  [H, q_dim]
             m->d_attn_out,                      // dX [T, q_dim] = dO
             grads->dW_o_proj[l],                // dW [H, q_dim]
@@ -1231,10 +1335,10 @@ void qwen3_backward(
 
         // Flash attention backward
         launch_flash_attention_backward(
-            state->layer_Q[l], state->layer_K[l], state->layer_V[l],
-            state->layer_O[l],
+            state->recomp_Q, state->recomp_K, state->recomp_V,
+            state->recomp_O,
             m->d_attn_out,                      // dO [T, q_dim]
-            state->layer_lse[l],
+            state->layer_lse[l],                // saved LSE (checkpointed)
             grads->D_buf,
             m->d_Q,                             // dQ [T, q_dim]
             m->d_K,                             // dK [T, kv_dim]
@@ -1242,46 +1346,46 @@ void qwen3_backward(
             B, S, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
             stream);
 
-        // RoPE backward (in-place on dQ, dK)
+        // RoPE backward
         launch_rope_backward(m->d_Q, m->d_K,
                             m->cos_table, m->sin_table, state->d_pos_ids,
                             T, c.num_attention_heads, c.num_key_value_heads,
                             c.head_dim, stream);
 
-        // QK-norm backward (Q): dX → d_attn_out
+        // QK-norm backward (Q)
         launch_rmsnorm_backward(
             m->d_attn_out,                      // dX [T, q_dim]
             grads->dW_q_norm[l],                // dW [head_dim]
             m->d_Q,                             // dY [T, q_dim]
-            state->layer_Q_raw[l],              // x
+            state->recomp_Q_raw,                // x  (recomputed)
             LW.q_norm,                          // w  [head_dim]
             T * c.num_attention_heads, c.head_dim, c.rms_norm_eps, stream);
 
-        // QK-norm backward (K): dX → d_mlp_mid (scratch)
+        // QK-norm backward (K)
         launch_rmsnorm_backward(
             m->d_mlp_mid,                       // dX [T, kv_dim]
             grads->dW_k_norm[l],                // dW [head_dim]
             m->d_K,                             // dY [T, kv_dim]
-            state->layer_K_raw[l],              // x
+            state->recomp_K_raw,                // x  (recomputed)
             LW.k_norm,                          // w  [head_dim]
             T * c.num_key_value_heads, c.head_dim, c.rms_norm_eps, stream);
 
-        // Recompute normed input → d_gate (scratch [T, H])
+        // Recompute normed input → d_gate (scratch)
         launch_rmsnorm(m->d_gate, state->layer_input[l],
                        LW.input_layernorm, T, H, c.rms_norm_eps, stream);
 
-        // Q proj backward: dX → d_hidden
+        // Q proj backward
         linear_backward_half(m->cublas,
-            m->d_attn_out,                      // dY [T, q_dim] (=dQ_raw)
+            m->d_attn_out,                      // dY [T, q_dim]
             m->d_gate,                          // X  [T, H] (normed input)
             LW.q_proj,                          // W  [q_dim, H]
             m->d_hidden,                        // dX [T, H]
             grads->dW_q_proj[l],                // dW [q_dim, H]
             T, c.q_dim, H);
 
-        // K proj backward: dX → d_Q (scratch), then accumulate
+        // K proj backward
         linear_backward_half(m->cublas,
-            m->d_mlp_mid,                       // dY [T, kv_dim] (=dK_raw)
+            m->d_mlp_mid,                       // dY [T, kv_dim]
             m->d_gate,                          // X  [T, H]
             LW.k_proj,                          // W  [kv_dim, H]
             m->d_Q,                             // dX [T, H] scratch
@@ -1289,7 +1393,7 @@ void qwen3_backward(
             T, c.kv_dim, H);
         add_residual(m->d_hidden, m->d_Q, T * H, stream);
 
-        // V proj backward: dX → d_Q (scratch), then accumulate
+        // V proj backward
         linear_backward_half(m->cublas,
             m->d_V,                             // dY [T, kv_dim]
             m->d_gate,                          // X  [T, H]
@@ -1304,7 +1408,7 @@ void qwen3_backward(
             m->d_Q,                             // dX [T, H]
             grads->dW_input_norm[l],            // dW [H]
             m->d_hidden,                        // dY [T, H]
-            state->layer_input[l],              // x  [T, H]
+            state->layer_input[l],              // x  [T, H] (checkpointed)
             LW.input_layernorm,                 // w  [H]
             T, H, c.rms_norm_eps, stream);
 

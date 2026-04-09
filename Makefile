@@ -58,6 +58,11 @@ $(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu $(HEADERS) |
 $(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu $(HEADERS) | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
+$(BUILDDIR)/test_fused_norm_linear: \
+    src/kernels/fused_norm_linear.cu src/kernels/rmsnorm.cu src/kernels/linear.cu \
+    tests/test_fused_norm_linear.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
+
 $(BUILDDIR)/test_linear_backward: src/kernels/linear.cu tests/test_linear_backward.cu $(HEADERS) | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
@@ -79,6 +84,7 @@ $(BUILDDIR)/test_attention_backward: src/kernels/attention.cu tests/test_attenti
 QWEN3_SRCS := src/model/qwen3.cu src/model/kv_cache.cu \
               src/kernels/rmsnorm.cu src/kernels/rope.cu src/kernels/attention.cu \
               src/kernels/swiglu.cu src/kernels/embedding.cu src/kernels/linear.cu \
+              src/kernels/fused_norm_linear.cu \
               src/kernels/config.cpp src/kernels/weights.cpp
 
 $(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu $(HEADERS) | $(BUILDDIR)
@@ -113,9 +119,12 @@ $(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp $(HEADERS) | $(BUILDD
 $(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp $(HEADERS) | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
 
-TRAIN_SRCS := $(QWEN3_SRCS) src/kernels/adamw.cu
+TRAIN_SRCS := $(QWEN3_SRCS) src/kernels/adamw.cu src/kernels/sampler.cu
 
 $(BUILDDIR)/train_sft: $(TRAIN_SRCS) tests/train_sft.cu $(HEADERS) | $(BUILDDIR)
+	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
+
+$(BUILDDIR)/train_grpo: $(TRAIN_SRCS) tests/train_grpo.cu $(HEADERS) | $(BUILDDIR)
 	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
 
 $(BUILDDIR):
@@ -123,7 +132,7 @@ $(BUILDDIR):
 
 # ── Run targets ────────────────────────────────────────────────────────────────
 
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo train_sft
+.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo train_sft train_grpo
 
 test_rmsnorm: $(BUILDDIR)/test_rmsnorm
 	./$(BUILDDIR)/test_rmsnorm
@@ -151,6 +160,9 @@ test_linear: $(BUILDDIR)/test_linear
 
 test_sampler: $(BUILDDIR)/test_sampler
 	./$(BUILDDIR)/test_sampler
+
+test_fused_norm_linear: $(BUILDDIR)/test_fused_norm_linear
+	./$(BUILDDIR)/test_fused_norm_linear
 
 test_linear_backward: $(BUILDDIR)/test_linear_backward
 	./$(BUILDDIR)/test_linear_backward
@@ -203,6 +215,9 @@ test_llmengine: $(BUILDDIR)/test_llmengine
 # Run with default smoke-test settings (100 steps, small batch)
 train_sft: $(BUILDDIR)/train_sft
 	./$(BUILDDIR)/train_sft
+
+train_grpo: $(BUILDDIR)/train_grpo
+	./$(BUILDDIR)/train_grpo
 
 tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights test_llmengine
 

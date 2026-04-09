@@ -104,6 +104,68 @@ public:
         return scheduler->is_finished();
     }
 
+    void sleep() {
+        delete scheduler; scheduler = nullptr;
+        qwen3_sleep(model_runner->model);
+    }
+
+    void wakeup() {
+        // Recompute KV budget: optimizer/training buffers may have consumed
+        // memory since the original compute_kv_budget ran at engine creation.
+        const auto& mc = model_runner->model_config;
+        size_t block_bytes = 2ULL * mc.num_hidden_layers * config.kv_block_size
+                           * mc.num_key_value_heads * mc.head_dim * sizeof(half);
+
+        size_t free_bytes, total_bytes;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        size_t reserved = 256ULL * 1024 * 1024;
+        if (free_bytes < reserved) free_bytes = reserved;
+        size_t budget = (size_t)(free_bytes * config.gpu_memory_utilization) - reserved;
+
+        int num_kv_blocks = (int)(budget / block_bytes);
+        num_kv_blocks = std::max(num_kv_blocks, 1);
+        // Don't exceed original budget (host-side block_tables are sized for it)
+        num_kv_blocks = std::min(num_kv_blocks, config.num_kv_blocks);
+        config.num_kv_blocks = num_kv_blocks;
+
+        qwen3_wakeup(model_runner->model, num_kv_blocks);
+        scheduler = new Scheduler(config);
+        seq_id_counter = 0;
+    }
+
+    // For grpo generation completion
+    std::map<int64_t, std::vector<int64_t>> generate_ids(
+        const std::vector<std::vector<int64_t>>& prompts,
+        const SamplingParams& sp,
+        int num_generations = 1)
+    {
+        const int B = (int)prompts.size();
+        const int total_seqs = B * num_generations;
+
+        for (int i = 0; i < B; i++)
+            for (int g = 0; g < num_generations; g++)
+                add_request(prompts[i], sp);
+
+        std::map<int64_t, std::vector<int64_t>> results;
+        int done = 0;
+        auto t0 = std::chrono::steady_clock::now();
+
+        while (!is_finished()) {
+            auto [completions, ntok] = step();
+            for (auto& [sid, tids] : completions) {
+                results[sid] = std::move(tids);
+                done++;
+            }
+            if (done % 8 == 0 || done == total_seqs) {
+                double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "\r  [gen] %d/%d seqs  %.1fs", done, total_seqs, elapsed);
+            }
+        }
+        fprintf(stderr, "\n");
+        return results;
+    }
+
     // Variant: accepts pre-tokenized inputs with per-sequence SamplingParams.
     // Returns an empty vector of strings (callers should use seq_id→token_ids map).
     // total_output_tokens is set to the sum of generated token counts.

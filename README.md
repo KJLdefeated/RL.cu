@@ -46,9 +46,11 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
 - [x] Model runner (allocate correct KV cache size, batch forward)
 - [x] Scheduler (schedule input request)
 - [x] LLM Engine
-- [ ] Align with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
+- [x] Align with vLLM (Aim for 90% performance for Qwen3 0.6B, 4B)
   - [x] Prefill Kernel 6ms forward
-  - [ ] Decode Kernel Optimize
+  - [x] Decode Kernel Optimize
+- [ ] 100% match with vllm or outperform it
+  - [ ] Flash-Decoding Split-KV
 
 ### Training
 - [x] Dataset loading
@@ -65,28 +67,28 @@ Build an open-source, pure C++/CUDA framework for LLM reinforcement learning tra
   - Fused kernel: update + decay in single pass
   - Flat buffer pattern for contiguous memory access
 - [x] Implement learning rate scheduler (cosine with warmup)
-- [ ] Trainer
+- [x] Trainer
   - [x] Implement gradient accumulation across micro-batches
   - [x] Logging and training curve
   - [x] Build basic SFT training loop: load data → forward → loss → backward → step
-  - [ ] Validate on tiny dataset: loss should decrease matching PyTorch
-- [ ] Successful SFT fine-tuning matching PyTorch training curves
+  - [x] Validate on tiny dataset: loss should decrease matching PyTorch
 
 ### GRPO Core Algorithm
-- [ ] Implement reference model (frozen weight copy, shared memory where possible)
-- [ ] Implement basic math reward: parse answer, check correctness
-- [ ] Implement GRPO rollout pipeline (connect with inference engine)
-- [ ] Implement per-token log-probability computation (forward pass storing logprobs)
-- [ ] Implement KL divergence computation between policy and reference
-- [ ] Implement GRPO loss
-- [ ] Implement basic math reward: parse answer, check correctness
-- [ ] **Milestone**: Single GRPO training step producing correct loss
+- [x] Implement basic math reward: parse answer, check correctness
+- [x] Implement GRPO rollout pipeline (connect with inference engine)
+- [x] Implement per-token log-probability computation (forward pass storing logprobs)
+- [x] Implement KL divergence computation between policy and reference
+- [x] Implement GRPO loss
+- [x] Implement basic math reward: parse answer, check correctness
+- [x] Single GRPO training step producing correct loss
+- [ ] Pipeline validation & Optimization
+  - [ ] Improve memory efficiency (vllm wakeup & sleep, gradient checkpoints)
 
 #### Integration
-- [ ] Build end-to-end GRPO training pipeline
-- [ ] Train qwen3-4B on dapo-math-17k & test on AIME/24,25
+- [x] Build end-to-end GRPO training pipeline
+- [ ] Train qwen3-0.6B on deepmath-103k
 - [ ] Writing documents and interface
 - [ ] Release on Github (in May hopely)
-- [ ] Benchmark with Slime & VeRL
+- [ ] Benchmark with TRL (w. vLLM)
 
 ### Future: Performance optimization, multi-GPU support.

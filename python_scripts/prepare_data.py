@@ -139,12 +139,18 @@ def format_sft_chat(messages: list[dict]) -> tuple[str, str]:
     return prompt, full
 
 
+GRPO_SYSTEM_PROMPT = (
+    "You are a helpful math assistant. "
+    "Solve the problem step by step using thinking mode. Use <think>...<think/> tags for your reasoning steps. "
+)
+
+
 def format_grpo_prompt(prompt_messages: list[dict]) -> str:
     """
     Format GRPO prompt messages into text using Qwen3 chat template.
-    Includes system message and assistant prefix for generation.
+    Uses a chain-of-thought system prompt and enables thinking mode.
     """
-    text = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+    text = f"<|im_start|>system\n{GRPO_SYSTEM_PROMPT}<|im_end|>\n"
     for msg in prompt_messages:
         text += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
     text += "<|im_start|>assistant\n"
@@ -321,12 +327,69 @@ def process_grpo(
     return all_tokens, answers
 
 
+def process_grpo_text(
+    table: pa.Table,
+    max_samples: int | None,
+) -> list[dict]:
+    """Process GRPO dataset: extract raw prompt text + ground truth answers.
+    Returns list of {"prompt": str, "answer": str} dicts (no tokenization)."""
+    prompt_col = table.column("prompt")
+    reward_col = table.column("reward_model")
+
+    samples = []
+    skipped = 0
+    seen_prompts = set()
+
+    n = len(table) if max_samples is None else min(len(table), max_samples)
+
+    for i in range(n):
+        if i % 50000 == 0 and i > 0:
+            print(f"  [{i}/{n}] processed, {len(samples)} unique, {skipped} skipped")
+
+        prompt_messages = prompt_col[i].as_py()
+        if not prompt_messages:
+            skipped += 1
+            continue
+
+        # Extract ground truth answer
+        reward_info = reward_col[i].as_py()
+        answer = reward_info.get("ground_truth", "") if reward_info else ""
+
+        # Deduplicate by prompt content
+        prompt_key = prompt_messages[0]["content"][:200] if prompt_messages else ""
+        if prompt_key in seen_prompts:
+            skipped += 1
+            continue
+        seen_prompts.add(prompt_key)
+
+        prompt_text = format_grpo_prompt(prompt_messages)
+
+        if len(prompt_text) < 20:
+            skipped += 1
+            continue
+
+        samples.append({"prompt": prompt_text, "answer": answer})
+
+    print(f"  Final: {len(samples)} unique prompts ({skipped} skipped)")
+    return samples
+
+
+def write_grpo_jsonl(output_path: str, samples: list[dict]):
+    """Write GRPO data as JSONL: one {"prompt": ..., "answer": ...} per line."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        for s in samples:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    file_size = os.path.getsize(output_path)
+    print(f"[write] {output_path}: {len(samples)} samples, {file_size / 1024 / 1024:.1f} MB")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare training data for RL.cu")
-    parser.add_argument("--mode", required=True, choices=["sft", "grpo"],
-                        help="Dataset mode: sft or grpo")
+    parser.add_argument("--mode", required=True, choices=["sft", "grpo", "grpo-text"],
+                        help="Dataset mode: sft, grpo (tokenized binary), or grpo-text (JSONL, tokenize at runtime)")
     parser.add_argument("--output", required=True,
                         help="Output binary file path (e.g., data/sft_train.bin)")
     parser.add_argument("--max-samples", type=int, default=None,
@@ -343,11 +406,6 @@ def main():
                         help="HuggingFace cache directory")
     args = parser.parse_args()
 
-    # Load tokenizer
-    print(f"[tokenizer] Loading {args.tokenizer}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    print(f"  Vocab size: {tokenizer.vocab_size}")
-
     # Load data
     if args.local_parquet:
         print(f"[data] Loading {len(args.local_parquet)} local parquet file(s)...")
@@ -361,27 +419,41 @@ def main():
     print(f"[data] Columns: {table.column_names}")
 
     # Process
-    if args.mode == "sft":
-        print(f"[sft] Processing (max_seq_len={args.max_seq_len}, "
-              f"min_score={args.min_score})...")
-        all_tokens, prompt_lens = process_sft(
-            table, tokenizer, args.max_samples, args.max_seq_len, args.min_score
-        )
-        write_binary(args.output, all_tokens, prompt_lens, answers=None)
+    if args.mode == "grpo-text":
+        # Text-only JSONL mode: no tokenization, stores raw prompt + answer
+        print(f"[grpo-text] Processing...")
+        samples = process_grpo_text(table, args.max_samples)
+        write_grpo_jsonl(args.output, samples)
+        prompt_lens = [len(s["prompt"]) for s in samples]
+        print(f"\n[stats] Samples: {len(samples)}")
+        print(f"  Prompt chars: min={min(prompt_lens)}, max={max(prompt_lens)}, "
+              f"mean={sum(prompt_lens)/len(prompt_lens):.0f}")
     else:
-        print(f"[grpo] Processing (max_seq_len={args.max_seq_len})...")
-        all_tokens, answers = process_grpo(
-            table, tokenizer, args.max_samples, args.max_seq_len
-        )
-        write_binary(args.output, all_tokens, prompt_lens=None, answers=answers)
+        # Tokenized binary modes (sft, grpo)
+        print(f"[tokenizer] Loading {args.tokenizer}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+        print(f"  Vocab size: {tokenizer.vocab_size}")
 
-    # Print stats
-    lengths = [len(t) for t in all_tokens]
-    print(f"\n[stats] Samples: {len(all_tokens)}")
-    print(f"  Tokens: {sum(lengths):,}")
-    print(f"  Seq len: min={min(lengths)}, max={max(lengths)}, "
-          f"mean={sum(lengths)/len(lengths):.0f}, "
-          f"median={sorted(lengths)[len(lengths)//2]}")
+        if args.mode == "sft":
+            print(f"[sft] Processing (max_seq_len={args.max_seq_len}, "
+                  f"min_score={args.min_score})...")
+            all_tokens, prompt_lens = process_sft(
+                table, tokenizer, args.max_samples, args.max_seq_len, args.min_score
+            )
+            write_binary(args.output, all_tokens, prompt_lens, answers=None)
+        else:
+            print(f"[grpo] Processing (max_seq_len={args.max_seq_len})...")
+            all_tokens, answers = process_grpo(
+                table, tokenizer, args.max_samples, args.max_seq_len
+            )
+            write_binary(args.output, all_tokens, prompt_lens=None, answers=answers)
+
+        lengths = [len(t) for t in all_tokens]
+        print(f"\n[stats] Samples: {len(all_tokens)}")
+        print(f"  Tokens: {sum(lengths):,}")
+        print(f"  Seq len: min={min(lengths)}, max={max(lengths)}, "
+              f"mean={sum(lengths)/len(lengths):.0f}, "
+              f"median={sorted(lengths)[len(lengths)//2]}")
 
 
 if __name__ == "__main__":

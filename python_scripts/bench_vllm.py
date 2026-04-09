@@ -29,9 +29,9 @@ MODEL_DIR  = os.path.join(REPO_ROOT, "model_weights", "Qwen3-0.6B")
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_DIR)
-    parser.add_argument("--num-seqs",    type=int, default=256)
+    parser.add_argument("--num-seqs",    type=int, default=64)
     parser.add_argument("--max-input",   type=int, default=1024)
-    parser.add_argument("--max-output",  type=int, default=1024)
+    parser.add_argument("--max-output",  type=int, default=4096)
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable CUDA graphs in vLLM (eager mode)")
     args = parser.parse_args()
@@ -56,7 +56,7 @@ def main() -> None:
         for _ in range(NUM_SEQS)
     ]
     sampling_params = [
-        SamplingParams(temperature=0.6, ignore_eos=True,
+        SamplingParams(temperature=0.8, ignore_eos=True,
                        max_tokens=randint(100, MAX_OUT_LEN))
         for _ in range(NUM_SEQS)
     ]
@@ -72,7 +72,7 @@ def main() -> None:
         model=args.model,
         dtype="float16",
         max_model_len=MAX_INPUT_LEN + MAX_OUT_LEN,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=0.9,
         enforce_eager=args.enforce_eager,
     )
 

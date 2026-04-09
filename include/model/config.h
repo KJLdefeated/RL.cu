@@ -43,6 +43,8 @@ struct Config {
     int64_t eos = -1;
     int kv_block_size = 16;  // must match KV_BLOCK_SIZE in kv_cache.cuh
     int num_kv_blocks = -1;
+    Config() = default;
+
     Config(std::string model_dir) {
         model = model_dir;
         tokenizer_path = model_dir + "/tokenizer.json";

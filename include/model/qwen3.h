@@ -69,6 +69,8 @@ struct Qwen3Model {
 
     int max_batch      = 0;
     int max_seq        = 0;
+    int max_T          = 0;  // current scratch buffer capacity in tokens
+    int infer_max_T    = 0;  // inference scratch size (restored on wakeup)
     int total_kv_blocks = 0;
 };
 
@@ -78,7 +80,16 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq, int max_batched_token
 
 void qwen3_free(Qwen3Model* model);
 
+// Ensure scratch buffers (d_hidden, d_Q, etc.) can hold at least T tokens.
+// Re-allocates if T > current max_T. Called automatically by qwen3_forward.
+void qwen3_ensure_scratch(Qwen3Model* m, int T);
+
 void qwen3_reset(Qwen3Model* model);
+
+// KV cache lifecycle for GRPO: sleep frees KV pools during training,
+// wakeup re-allocates them before generation.
+void qwen3_sleep(Qwen3Model* m);
+void qwen3_wakeup(Qwen3Model* m, int total_blocks);
 
 half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch, cudaStream_t stream = 0);
 
@@ -101,32 +112,45 @@ void qwen3_free_seq_slot(Qwen3Model* m, int b);
 // Training forward pass
 // =============================================================================
 
-// Saved activations for backward pass.
-// All per-layer arrays are indexed by layer: ptr_array[layer_idx] → device pointer.
-// Bulk-allocated in two pools (half activations + float LSE).
+// Saved activations for backward pass with GRADIENT CHECKPOINTING.
+//
+// Only the layer input residual and flash-attention LSE are saved per layer.
+// All other activations (Q, K, V, O, gate, up, ...) are recomputed from the
+// residual at the start of each layer's backward pass.  This trades ~30% extra
+// compute for ~10× less activation memory (70 GB → 6.6 GB at T=72000).
+//
+// Memory layout:
+//   checkpoint_pool (half): [L × T×H]  layer_input  +  [T×H] final_hidden
+//   lse_pool        (float): [L × T×H_q]  flash-attention LSE
+//   recomp_pool     (half): single-layer recomputation scratch (Q_raw, K_raw,
+//                           Q, K, V, O, post_attn, gate, up)
 struct Qwen3TrainState {
     int B = 0, S = 0, T = 0;   // batch, seq_len, total tokens (B*S)
     int num_layers = 0;
 
     // --- Bulk GPU allocations ---
-    half*  activation_pool = nullptr;   // one big alloc for all half activations
-    float* lse_pool        = nullptr;   // one big alloc for all LSE (FP32)
+    half*  checkpoint_pool = nullptr;   // per-layer residuals + final_hidden
+    float* lse_pool        = nullptr;   // per-layer LSE (FP32)
+    half*  recomp_pool     = nullptr;   // single-layer recomputation scratch
 
-    // Per-layer saved activations (pointers into pools)
-    half** layer_input     = nullptr;   // [L] → [T, hidden]         pre-input_norm residual
-    half** layer_Q_raw     = nullptr;   // [L] → [T, q_dim]          after q_proj, before QK-norm
-    half** layer_K_raw     = nullptr;   // [L] → [T, kv_dim]         after k_proj, before QK-norm
-    half** layer_Q         = nullptr;   // [L] → [T, q_dim]          after QK-norm + RoPE
-    half** layer_K         = nullptr;   // [L] → [T, kv_dim]         after QK-norm + RoPE
-    half** layer_V         = nullptr;   // [L] → [T, kv_dim]         V values (unchanged)
-    half** layer_O         = nullptr;   // [L] → [T, q_dim]          attention output
-    half** layer_post_attn = nullptr;   // [L] → [T, hidden]         pre-post_attn_norm residual
-    half** layer_gate      = nullptr;   // [L] → [T, intermediate]   gate proj output
-    half** layer_up        = nullptr;   // [L] → [T, intermediate]   up proj output
-    float** layer_lse      = nullptr;   // [L] → [B, S, H_q]         logsumexp from FA2
+    // Per-layer checkpointed activations (pointers into checkpoint_pool)
+    half** layer_input     = nullptr;   // [L] → [T, hidden]   pre-layer residual
+    float** layer_lse      = nullptr;   // [L] → [T, H_q]      FA2 logsumexp
 
-    // Final stage
-    half* final_hidden     = nullptr;   // [T, hidden] — after all layers, before final_norm
+    // Final stage (pointer into checkpoint_pool)
+    half* final_hidden     = nullptr;   // [T, hidden] — after all layers
+
+    // Single-layer recomputation buffers (pointers into recomp_pool)
+    // Filled by recomputing forward for one layer during backward.
+    half* recomp_Q_raw     = nullptr;   // [T, q_dim]
+    half* recomp_K_raw     = nullptr;   // [T, kv_dim]
+    half* recomp_Q         = nullptr;   // [T, q_dim]      after QK-norm + RoPE
+    half* recomp_K         = nullptr;   // [T, kv_dim]     after QK-norm + RoPE
+    half* recomp_V         = nullptr;   // [T, kv_dim]
+    half* recomp_O         = nullptr;   // [T, q_dim]      attention output
+    half* recomp_post_attn = nullptr;   // [T, hidden]     post-attention residual
+    half* recomp_gate      = nullptr;   // [T, intermediate]
+    half* recomp_up        = nullptr;   // [T, intermediate]
 
     // Logits scratch for lm_head (chunked to avoid [T, vocab] allocation)
     // Size: [TRAIN_LOGITS_CHUNK, vocab_size]

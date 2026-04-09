@@ -334,7 +334,7 @@ Measurements on RTX PRO 6000 (sm_120), Qwen3-0.6B, FP16, 256 queued seqs:
 
 | Factor | grpo-cuda | nano-vllm |
 |--------|-----------|-----------|
-| Throughput (256 seqs) | **6963 tok/s** | ~7411 tok/s |
+| Throughput (256 seqs) | **6963 tok/s** | 8717.55tok/s |
 | Graph execution | Yes (buckets 1–256) | Yes |
 | Sampler | Gumbel-max | Gumbel-max |
 | Attention decode | 1 thread / (seq, head) | FlashDecoding (split-K) |

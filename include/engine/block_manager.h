@@ -89,44 +89,10 @@ public:
     }
 
     void allocate(Sequence& seq) {
-        int64_t prefix_hash = -1;
-        bool cache_miss = false;
         for (int i = 0; i < seq.num_blocks(); ++i) {
-            int start_idx = i * block_size;
-            int end_idx = std::min(start_idx + block_size, (int)seq.token_ids.size());
-            std::vector<int64_t> block_token_ids(
-                seq.token_ids.begin() + start_idx,
-                seq.token_ids.begin() + end_idx);
-
-            int64_t h = -1;
-            if ((int)block_token_ids.size() == block_size) {
-                h = compute_hash(block_token_ids, prefix_hash);
-            }
-
-            int block_id;
-            if (!cache_miss && h != -1) {
-                auto it = hash_to_block_id.find(h);
-                if (it != hash_to_block_id.end() &&
-                    blocks[it->second].token_ids == block_token_ids) {
-                    // Cache hit: reuse block, bump ref count
-                    block_id = it->second;
-                    blocks[block_id].ref_cnt++;
-                    seq.num_cached_tokens += block_size;
-                    prefix_hash = h;
-                    seq.block_table.push_back(block_id);
-                    continue;
-                }
-            }
-            // Cache miss (or partial block): allocate fresh block
-            cache_miss = true;
-            block_id = free_block_ids.front();
+            int block_id = free_block_ids.front();
             free_block_ids.pop_front();
             _allocate_block(block_id);
-            if (h != -1) {
-                hash_to_block_id[h] = block_id;
-                blocks[block_id].update(h, block_token_ids);
-                prefix_hash = h;
-            }
             seq.block_table.push_back(block_id);
         }
     }
