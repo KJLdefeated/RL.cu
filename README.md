@@ -39,10 +39,11 @@ A from-scratch implementation of the complete LLM RL pipeline — hand-written C
 
 ### Requirements
 - CUDA Toolkit >= 12.0
+- CMake >= 3.18
 - GPU: Ampere or newer (sm_80+)
 - Python 3.8+ (only for downloading model weights / preparing data)
 
-### Build & Run
+### Build
 
 ```bash
 git clone https://github.com/KJLdefeated/RL.cu.git && cd RL.cu
@@ -51,10 +52,31 @@ git clone https://github.com/KJLdefeated/RL.cu.git && cd RL.cu
 pip install huggingface_hub
 python python_scripts/download_model.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
 
-# Build
-make build/test_llmengine
+# Build all targets (default: sm_120; override with ARCH=90 for H100, etc.)
+make
 
-# Run inference (includes correctness tests + throughput benchmark)
+# Or build a specific target
+make build/test_llmengine
+```
+
+### Makefile Commands
+
+| Command | Description |
+|---------|-------------|
+| `make` | Configure + build all targets |
+| `make build/<target>` | Build a specific binary |
+| `make test_rmsnorm` | Build + run a single test |
+| `make tests` | Build + run all kernel & model tests |
+| `make train_grpo` | Build + run GRPO training (default args) |
+| `make train_sft` | Build + run SFT training (default args) |
+| `make clean` | Remove build directory |
+| `make ARCH=90` | Target a specific GPU arch (e.g. 80=A100, 89=RTX4090, 90=H100) |
+| `make BUILD_TYPE=Debug` | Debug build |
+
+### Run Inference
+
+```bash
+# Correctness tests + throughput benchmark
 ./build/test_llmengine model_weights/Qwen3-0.6B
 ```
 
@@ -66,9 +88,33 @@ pip install datasets
 python python_scripts/prepare_data.py --mode grpo-text \
     --dataset trl-lib/DeepMath-103K --output data/deepmath-103k.jsonl
 
-# Build & run GRPO training
-make build/train_grpo
-./build/train_grpo model_weights/Qwen3-0.6B data/deepmath-103k.jsonl 100
+# Run with default settings (8 prompts x 8 gens, 100 steps)
+./build/train_grpo
+
+# Or customize (see --help for all options)
+./build/train_grpo \
+    --model model_weights/Qwen3-0.6B \
+    --data data/deepmath-103k.jsonl \
+    --batch-size 64 --num-gens 8 \
+    --lr 1e-6 --total-steps 500 \
+    --save-dir checkpoints/my_run
+```
+
+### SFT Training
+
+```bash
+# Prepare dataset
+python python_scripts/prepare_data.py --mode sft --output data/sft_train.bin
+
+# Run with default settings
+./build/train_sft
+
+# Or customize
+./build/train_sft \
+    --model model_weights/Qwen3-0.6B \
+    --data data/sft_train.bin \
+    --batch-size 8 --seq-len 2048 \
+    --lr 1e-5 --total-steps 5000
 ```
 
 ## Kernels

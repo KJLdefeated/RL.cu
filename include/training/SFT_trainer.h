@@ -54,7 +54,7 @@ __global__ static void nll_loss_grad_kernel(
 
 class SFTTrainer : public Trainer {
 public:
-    SFTTrainer(const TrainingConfig& config, Qwen3Model* model, )
+    SFTTrainer(const TrainingConfig& config, Qwen3Model* model)
         : Trainer(config, model)
     {
         // Allocate scalar accumulators on device

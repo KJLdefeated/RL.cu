@@ -1,235 +1,89 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Makefile — GRPO-CUDA kernel tests
+# Makefile — thin wrapper around CMake
 #
-# Quick-start:
-#   make tests              # build + run all three kernel tests
-#   make test_rmsnorm       # build + run rmsnorm only
-#   make generate_refs      # generate PyTorch reference data (needs torch)
+# Usage:
+#   make                    # configure + build all targets
+#   make test_attention     # build + run a single test
+#   make tests              # build + run all kernel tests
+#   make train_grpo         # build + run GRPO training (default args)
 #   make clean              # remove build/
 #
-# To target a specific GPU architecture instead of auto-detect:
-#   make tests ARCH=sm_120  # Blackwell (RTX PRO 6000 / RTX 50xx)  ← this machine
-#   make tests ARCH=sm_89   # Ada       (RTX 40xx)
-#   make tests ARCH=sm_86   # Ampere    (RTX 30xx)
-#   make tests ARCH=sm_80   # A100
+# CMake options (passed through):
+#   make ARCH=90            # target sm_90 (default: native auto-detect)
+#   make BUILD_TYPE=Debug   # debug build
 # ──────────────────────────────────────────────────────────────────────────────
 
-CUDA_HOME := /usr/local/cuda-12.8
-NVCC      := $(CUDA_HOME)/bin/nvcc
-ARCH      := sm_120
-CUTLASS_INC := third_party/cutlass/include
-INCLUDES  := -I include -I$(CUTLASS_INC)
-NVCCFLAGS := -O2 -std=c++17 $(INCLUDES) --gpu-architecture=$(ARCH) \
-             --expt-relaxed-constexpr -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1
-CXX       := g++
+BUILDDIR   := build
+BUILD_TYPE ?= Release
+ARCH       ?= 120
+PYTHON     := python3
+CMAKE_ARGS := -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
+              -DCMAKE_CUDA_ARCHITECTURES=$(ARCH)
 
-BUILDDIR  := build
-PYTHON    := python3
+NPROC := $(shell nproc 2>/dev/null || echo 4)
 
-# All headers — any change forces a rebuild of binaries that include them
-HEADERS   := $(shell find include -name "*.h" -o -name "*.cuh")
+# ── Core build rules ─────────────────────────────────────────────────────────
 
-# ── Kernel test binaries ───────────────────────────────────────────────────────
+.PHONY: all configure clean
 
-$(BUILDDIR)/test_rmsnorm: src/kernels/rmsnorm.cu tests/test_rmsnorm.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+all: configure
+	cmake --build $(BUILDDIR) -j$(NPROC)
 
-$(BUILDDIR)/test_softmax: src/kernels/softmax.cu tests/test_softmax.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+configure: $(BUILDDIR)/CMakeCache.txt
 
-$(BUILDDIR)/test_swiglu: src/kernels/swiglu.cu tests/test_swiglu.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+$(BUILDDIR)/CMakeCache.txt: CMakeLists.txt
+	cmake -B $(BUILDDIR) $(CMAKE_ARGS)
 
-$(BUILDDIR)/test_attention: src/kernels/attention.cu tests/test_attention.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+# Build a specific target: make build/<name>
+$(BUILDDIR)/%: configure
+	cmake --build $(BUILDDIR) --target $* -j$(NPROC)
 
-$(BUILDDIR)/test_kv_cache: src/model/kv_cache.cu tests/test_kv_cache.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+# ── Test targets (build + run) ────────────────────────────────────────────────
 
-$(BUILDDIR)/test_rope: src/kernels/rope.cu tests/test_rope.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+KERNEL_TESTS := test_rmsnorm test_softmax test_swiglu test_attention \
+                test_rope test_embedding test_linear test_sampler \
+                test_fused_norm_linear test_kv_cache
 
-$(BUILDDIR)/test_embedding: src/kernels/embedding.cu tests/test_embedding.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+BACKWARD_TESTS := test_linear_backward test_embedding_backward \
+                  test_rmsnorm_backward test_swiglu_backward \
+                  test_rope_backward test_attention_backward
 
-$(BUILDDIR)/test_linear: src/kernels/linear.cu tests/test_linear.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
+MODEL_TESTS := test_qwen3 test_qwen3_forward test_qwen3_backward \
+               test_fwd_bwd test_adamw test_llmengine
 
-$(BUILDDIR)/test_sampler: src/kernels/sampler.cu tests/test_sampler.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
+CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights
 
-$(BUILDDIR)/test_fused_norm_linear: \
-    src/kernels/fused_norm_linear.cu src/kernels/rmsnorm.cu src/kernels/linear.cu \
-    tests/test_fused_norm_linear.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
+ALL_TESTS := $(KERNEL_TESTS) $(BACKWARD_TESTS) $(MODEL_TESTS) $(CPP_TESTS)
 
-$(BUILDDIR)/test_linear_backward: src/kernels/linear.cu tests/test_linear_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
+.PHONY: tests $(ALL_TESTS) bench_decode train_sft train_grpo
 
-$(BUILDDIR)/test_embedding_backward: src/kernels/embedding.cu tests/test_embedding_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-$(BUILDDIR)/test_rmsnorm_backward: src/kernels/rmsnorm.cu tests/test_rmsnorm_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-$(BUILDDIR)/test_swiglu_backward: src/kernels/swiglu.cu tests/test_swiglu_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-$(BUILDDIR)/test_rope_backward: src/kernels/rope.cu tests/test_rope_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-$(BUILDDIR)/test_attention_backward: src/kernels/attention.cu tests/test_attention_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-QWEN3_SRCS := src/model/qwen3.cu src/model/kv_cache.cu \
-              src/kernels/rmsnorm.cu src/kernels/rope.cu src/kernels/attention.cu \
-              src/kernels/swiglu.cu src/kernels/embedding.cu src/kernels/linear.cu \
-              src/kernels/fused_norm_linear.cu \
-              src/kernels/config.cpp src/kernels/weights.cpp
-
-$(BUILDDIR)/test_qwen3: $(QWEN3_SRCS) tests/test_qwen3.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/test_qwen3_forward: $(QWEN3_SRCS) tests/test_qwen3_forward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/test_qwen3_backward: $(QWEN3_SRCS) tests/test_qwen3_backward.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/test_fwd_bwd: $(QWEN3_SRCS) tests/test_fwd_bwd.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/test_adamw: $(QWEN3_SRCS) src/kernels/adamw.cu tests/test_adamw.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/bench_decode: $(QWEN3_SRCS) tests/bench_decode.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-ENGINE_SRCS := $(QWEN3_SRCS) src/kernels/sampler.cu
-
-$(BUILDDIR)/test_llmengine: $(ENGINE_SRCS) tests/test_llmengine.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/test_dataloader: tests/test_dataloader.cpp $(HEADERS) | $(BUILDDIR)
-	$(CXX) -O2 -std=c++17 -I include -o $@ $(filter-out $(HEADERS),$^)
-
-$(BUILDDIR)/test_lr_scheduler: tests/test_lr_scheduler.cpp $(HEADERS) | $(BUILDDIR)
-	$(CXX) -O2 -std=c++17 -I include -o $@ $(filter-out $(HEADERS),$^)
-
-$(BUILDDIR)/test_loading_weights: src/kernels/config.cpp src/kernels/weights.cpp tests/test_loading_weights.cpp $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@
-
-TRAIN_SRCS := $(QWEN3_SRCS) src/kernels/adamw.cu src/kernels/sampler.cu
-
-$(BUILDDIR)/train_sft: $(TRAIN_SRCS) tests/train_sft.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR)/train_grpo: $(TRAIN_SRCS) tests/train_grpo.cu $(HEADERS) | $(BUILDDIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out $(HEADERS),$^) -o $@ -lcublas
-
-$(BUILDDIR):
-	mkdir -p $(BUILDDIR)
-
-# ── Run targets ────────────────────────────────────────────────────────────────
-
-.PHONY: test_rmsnorm test_softmax test_swiglu test_attention test_attention_backward test_kv_cache test_rope test_embedding test_embedding_backward test_rmsnorm_backward test_swiglu_backward test_rope_backward test_linear test_linear_backward test_sampler test_qwen3 test_qwen3_forward test_qwen3_backward test_fwd_bwd test_adamw test_dataloader test_lr_scheduler test_loading_weights bench_decode test_llmengine tests generate_refs clean prepare_sft prepare_grpo train_sft train_grpo
-
-test_rmsnorm: $(BUILDDIR)/test_rmsnorm
-	./$(BUILDDIR)/test_rmsnorm
-
-test_softmax: $(BUILDDIR)/test_softmax
-	./$(BUILDDIR)/test_softmax
-
-test_swiglu: $(BUILDDIR)/test_swiglu
-	./$(BUILDDIR)/test_swiglu
-
-test_attention: $(BUILDDIR)/test_attention
-	./$(BUILDDIR)/test_attention
-
-test_kv_cache: $(BUILDDIR)/test_kv_cache
-	./$(BUILDDIR)/test_kv_cache
-
-test_rope: $(BUILDDIR)/test_rope
-	./$(BUILDDIR)/test_rope
-
-test_embedding: $(BUILDDIR)/test_embedding
-	./$(BUILDDIR)/test_embedding
-
-test_linear: $(BUILDDIR)/test_linear
-	./$(BUILDDIR)/test_linear
-
-test_sampler: $(BUILDDIR)/test_sampler
-	./$(BUILDDIR)/test_sampler
-
-test_fused_norm_linear: $(BUILDDIR)/test_fused_norm_linear
-	./$(BUILDDIR)/test_fused_norm_linear
-
-test_linear_backward: $(BUILDDIR)/test_linear_backward
-	./$(BUILDDIR)/test_linear_backward
-
-test_embedding_backward: $(BUILDDIR)/test_embedding_backward
-	./$(BUILDDIR)/test_embedding_backward
-
-test_rmsnorm_backward: $(BUILDDIR)/test_rmsnorm_backward
-	./$(BUILDDIR)/test_rmsnorm_backward
-
-test_swiglu_backward: $(BUILDDIR)/test_swiglu_backward
-	./$(BUILDDIR)/test_swiglu_backward
-
-test_rope_backward: $(BUILDDIR)/test_rope_backward
-	./$(BUILDDIR)/test_rope_backward
-
-test_attention_backward: $(BUILDDIR)/test_attention_backward
-	./$(BUILDDIR)/test_attention_backward
-
-test_qwen3: $(BUILDDIR)/test_qwen3
-	./$(BUILDDIR)/test_qwen3
-
-test_qwen3_forward: $(BUILDDIR)/test_qwen3_forward
-	./$(BUILDDIR)/test_qwen3_forward
-
-test_qwen3_backward: $(BUILDDIR)/test_qwen3_backward
-	./$(BUILDDIR)/test_qwen3_backward
-
-test_fwd_bwd: $(BUILDDIR)/test_fwd_bwd
-	./$(BUILDDIR)/test_fwd_bwd
-
-test_adamw: $(BUILDDIR)/test_adamw
-	./$(BUILDDIR)/test_adamw
-
-test_dataloader: $(BUILDDIR)/test_dataloader
-	./$(BUILDDIR)/test_dataloader
-
-test_lr_scheduler: $(BUILDDIR)/test_lr_scheduler
-	./$(BUILDDIR)/test_lr_scheduler
-
-test_loading_weights: $(BUILDDIR)/test_loading_weights
-	./$(BUILDDIR)/test_loading_weights
+# Generic: "make test_foo" builds and runs ./build/test_foo
+$(ALL_TESTS): %: $(BUILDDIR)/%
+	./$(BUILDDIR)/$@
 
 bench_decode: $(BUILDDIR)/bench_decode
 	./$(BUILDDIR)/bench_decode
 
-test_llmengine: $(BUILDDIR)/test_llmengine
-	./$(BUILDDIR)/test_llmengine
-
-# Run with default smoke-test settings (100 steps, small batch)
 train_sft: $(BUILDDIR)/train_sft
 	./$(BUILDDIR)/train_sft
 
 train_grpo: $(BUILDDIR)/train_grpo
 	./$(BUILDDIR)/train_grpo
 
-tests: test_rmsnorm test_softmax test_swiglu test_attention test_kv_cache test_rope test_embedding test_linear test_sampler test_qwen3 test_loading_weights test_llmengine
+tests: $(KERNEL_TESTS) $(MODEL_TESTS) test_loading_weights
 
-# ── PyTorch reference generator ───────────────────────────────────────────────
+# ── Data preparation ─────────────────────────────────────────────────────────
+
+.PHONY: prepare_sft prepare_grpo
 
 prepare_sft:
 	$(PYTHON) python_scripts/prepare_data.py --mode sft --output data/sft_train.bin
 
 prepare_grpo:
-	$(PYTHON) python_scripts/prepare_data.py --mode grpo --output data/grpo_train.bin
+	$(PYTHON) python_scripts/prepare_data.py --mode grpo-text \
+		--dataset trl-lib/DeepMath-103K --output data/deepmath-103k.jsonl
 
-# ── Cleanup ────────────────────────────────────────────────────────────────────
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 
 clean:
 	rm -rf $(BUILDDIR)

@@ -8,36 +8,9 @@
 
 using namespace nvcuda;
 
-// =============================================================================
-// Flash Attention kernels
-// =============================================================================
-//
-// Prefill: WMMA Tensor Core kernel
-//   block = (32) — 1 warp handles one Br=16 Q tile against all KV tiles.
-//   Q×K^T and P×V computed via 16×16×16 WMMA ops (8 steps over HEAD_DIM=128).
-//   Online softmax maintained in shared memory per row.
-//   ~22 KB shared memory per block; one warp → high occupancy.
-//
-// Backward (dQ, dK, dV): warp-parallel reduction kernel (unchanged)
-//   block = (32, Br) — 1 warp per Q/KV row, 4 dims per thread.
-//   DIMS_PER_THREAD = HEAD_DIM / WARP_SIZE = 128 / 32 = 4
-//   Dot products via __shfl_xor_sync warp reduction.
-//
-// =============================================================================
+static constexpr int WARP_SIZE = 32;
 
-static constexpr int WARP_SIZE        = 32;
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, mask);
-    return val;
-}
-
-// =============================================================================
 // FA2 Prefill Kernel  (WMMA Tensor Core, 4 warps, Bc=64, async double-buffer K/V)
-// =============================================================================
-//
 // Grid:  (ceil(S/Br), H_q, B)
 // Block: (NUM_WARPS * 32 = 128)  — 4 warps
 //
@@ -71,9 +44,6 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 //   correctness preserved: OOB K scores masked to -INF; OOB V rows have P=0).
 //
 // Barriers per KV tile: 7 (same as single-buffer; async hides load latency)
-// =============================================================================
-
-// =============================================================================
 
 template<int HEAD_DIM, int Br, int Bc, int NUM_WARPS>
 __global__ void flash_attention_prefill_kernel(
@@ -386,85 +356,7 @@ __global__ void flash_attention_prefill_kernel(
     }
 }
 
-// =============================================================================
-// Paged Attention Decode Kernel v1  (scalar baseline — block=1)
-// =============================================================================
-
-template<int HEAD_DIM, int BLOCK_SIZE>
-__global__ void paged_attention_decode_kernel(
-    const half* __restrict__ q,
-    const half* __restrict__ k_cache,
-    const half* __restrict__ v_cache,
-    half*       __restrict__ out,
-    const int*  __restrict__ block_tables,
-    const int*  __restrict__ seq_lens,
-    float scale,
-    int max_blocks_per_seq,
-    int H_q, int H_kv
-) {
-    const int seq_idx = blockIdx.x;
-    const int h_q     = blockIdx.y;
-    const int h_kv    = h_q * H_kv / H_q;
-
-    const int context_len = seq_lens[seq_idx];
-    const int num_blocks  = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    float q_reg[HEAD_DIM];
-    {
-        const half* q_ptr = q + (seq_idx * H_q + h_q) * HEAD_DIM;
-        #pragma unroll
-        for (int d = 0; d < HEAD_DIM; d++)
-            q_reg[d] = __half2float(q_ptr[d]);
-    }
-
-    float max_score = -INFINITY;
-    float sum_exp   = 0.0f;
-    float acc[HEAD_DIM];
-    #pragma unroll
-    for (int d = 0; d < HEAD_DIM; d++) acc[d] = 0.0f;
-
-    const int* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
-
-    for (int blk = 0; blk < num_blocks; blk++) {
-        const int physical_block  = seq_block_table[blk];
-        const int tokens_in_block = min(BLOCK_SIZE, context_len - blk * BLOCK_SIZE);
-
-        const long block_base =
-            ((long)physical_block * H_kv + h_kv) * BLOCK_SIZE * HEAD_DIM;
-
-        for (int tok = 0; tok < tokens_in_block; tok++) {
-            const half* k_ptr = k_cache + block_base + (long)tok * HEAD_DIM;
-            const half* v_ptr = v_cache + block_base + (long)tok * HEAD_DIM;
-
-            float score = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; d++)
-                score += q_reg[d] * __half2float(k_ptr[d]);
-            score *= scale;
-
-            const float new_max = fmaxf(max_score, score);
-            const float alpha   = expf(max_score - new_max);
-            const float p       = expf(score - new_max);
-
-            sum_exp = sum_exp * alpha + p;
-            #pragma unroll
-            for (int d = 0; d < HEAD_DIM; d++)
-                acc[d] = acc[d] * alpha + p * __half2float(v_ptr[d]);
-
-            max_score = new_max;
-        }
-    }
-
-    half* out_ptr = out + (seq_idx * H_q + h_q) * HEAD_DIM;
-    const float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
-    #pragma unroll
-    for (int d = 0; d < HEAD_DIM; d++)
-        out_ptr[d] = __float2half(acc[d] * inv);
-}
-
-// =============================================================================
-// Paged Attention Decode Kernel v2  (warp-parallel — block=32)
-//
+// Paged Attention Decode Kernel
 // Optimization: one warp (32 threads) per (seq, head) instead of one thread.
 //   - Each thread owns ELEMS = HEAD_DIM/32 = 4 consecutive elements.
 //   - K/V reads are coalesced: 32 threads × 4 halves = 128 halves in one
@@ -474,8 +366,6 @@ __global__ void paged_attention_decode_kernel(
 //   - Online softmax scalars (max_score, sum_exp) are identical on all threads
 //     after the reduce, so each thread updates them independently.
 //   - Vectorized 8-byte int2 load per thread per token (4 halves at once).
-// =============================================================================
-
 // Flash Decoding decode kernel: NUM_WARPS warps per (seq, head) split the context
 // length in a strided pattern, accumulate partial softmax states, then merge.
 //
