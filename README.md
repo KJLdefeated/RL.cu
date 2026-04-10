@@ -15,6 +15,7 @@
   <a href="#training">Training</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
+  <a href="#license">License</a> &bull;
   <a href="#develop-with-claude-code">Claude Code</a>
 </p>
 
@@ -266,3 +267,7 @@ Contributions welcome! Some areas where help would be great:
 - **More model architectures** — Llama, Gemma, etc.
 - **Speculative decoding** — draft model + verification
 - **Quantization** — INT8/INT4 weight quantization
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
