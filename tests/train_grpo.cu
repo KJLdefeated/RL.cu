@@ -103,6 +103,17 @@ static float boxed_reward(const std::string& completion, const std::string& answ
     return (normalize_answer(pred) == normalize_answer(answer)) ? 1.0f : 0.0f;
 }
 
+// Shaped reward: correctness + format bonus.
+//   1.0  if correct answer (in \boxed{})
+//   0.1  if \boxed{} present but wrong answer (encourages formatting)
+//   0.0  if no \boxed{} found
+static float shaped_reward(const std::string& completion, const std::string& answer) {
+    std::string pred = extract_predicted_answer(completion);
+    if (pred.empty()) return 0.0f;
+    if (normalize_answer(pred) == normalize_answer(answer)) return 1.0f;
+    return 0.1f;  // format bonus: produced \boxed{} but wrong answer
+}
+
 // ============================================================
 // Argument parsing
 // ============================================================
@@ -122,6 +133,10 @@ static void print_usage(const char* prog) {
         "  --temperature F     sampling temperature       (default: 0.8)\n"
         "  --top-p       F     nucleus sampling p         (default: 1.0)\n"
         "  --top-k       N     top-k sampling             (default: 0 = off)\n"
+        "  --kl-beta     F     KL penalty to ref model    (default: 0.04)\n"
+        "  --kl-target   F     dynamic KL target          (default: 0.04, 0=fixed beta)\n"
+        "  --no-filter-overlong  disable overlong filtering\n"
+        "  --reward      TYPE  boxed | shaped             (default: shaped)\n"
         "\nOptimizer:\n"
         "  --lr          F     learning rate              (default: 1e-6)\n"
         "  --min-lr      F     min LR after cosine decay  (default: 0)\n"
@@ -163,6 +178,10 @@ int main(int argc, char** argv) {
     float gen_temperature       = 0.8f;
     float gen_top_p             = 1.0f;
     int   gen_top_k             = 0;
+    float kl_beta               = 0.04f;
+    float kl_target             = 0.04f;
+    bool  filter_overlong       = true;
+    std::string reward_type     = "shaped";
     float base_lr               = 1e-6f;
     float min_lr                = 0.0f;
     int   warmup_steps          = 50;
@@ -196,6 +215,10 @@ int main(int argc, char** argv) {
         else if (eq("--temperature"))       gen_temperature    = (float)atof(next());
         else if (eq("--top-p"))             gen_top_p          = (float)atof(next());
         else if (eq("--top-k"))             gen_top_k          = atoi(next());
+        else if (eq("--kl-beta"))           kl_beta            = (float)atof(next());
+        else if (eq("--kl-target"))         kl_target          = (float)atof(next());
+        else if (eq("--no-filter-overlong")) filter_overlong   = false;
+        else if (eq("--reward"))            reward_type        = next();
         else if (eq("--lr"))                base_lr            = (float)atof(next());
         else if (eq("--min-lr"))            min_lr             = (float)atof(next());
         else if (eq("--warmup"))            warmup_steps       = atoi(next());
@@ -244,6 +267,12 @@ int main(int argc, char** argv) {
     printf("  max_comp / seq : %d / %d\n",  max_completion_len, max_seq_len);
     printf("  sampling       : temp=%.2f  top_p=%.2f  top_k=%d\n",
            gen_temperature, gen_top_p, gen_top_k);
+    printf("  reward         : %s\n", reward_type.c_str());
+    printf("  filter_overlong: %s\n", filter_overlong ? "yes" : "no");
+    printf("  kl_beta        : %.4f  (%s)\n",
+           kl_beta, kl_beta > 0 ? "KL-to-ref enabled" : "off");
+    printf("  kl_target      : %.4f  (%s)\n",
+           kl_target, kl_target > 0 ? "dynamic" : "fixed beta");
     printf("  lr schedule    : %s  (%.2e -> %.2e, warmup=%d, total=%d)\n",
            schedule == LRScheduleType::Cosine ? "cosine" : "constant",
            base_lr, min_lr, warmup_steps, total_steps);
@@ -271,6 +300,9 @@ int main(int argc, char** argv) {
     config.gen_temperature    = gen_temperature;
     config.gen_top_p          = gen_top_p;
     config.gen_top_k          = gen_top_k;
+    config.kl_beta            = kl_beta;
+    config.kl_target          = kl_target;
+    config.filter_overlong    = filter_overlong;
     config.base_lr            = base_lr;
     config.min_lr             = min_lr;
     config.total_steps        = total_steps;
@@ -282,9 +314,19 @@ int main(int argc, char** argv) {
     config.lr_schedule_type   = schedule;
     config.recompute();
 
+    // ── Select reward function ────────────────────────────────────────────────
+    RewardFn reward = (RewardFn)shaped_reward;
+    if (reward_type == "boxed") {
+        reward = (RewardFn)boxed_reward;
+    } else if (reward_type != "shaped") {
+        fprintf(stderr, "Unknown reward type: %s (use 'boxed' or 'shaped')\n",
+                reward_type.c_str());
+        return 1;
+    }
+
     // ── Run training ─────────────────────────────────────────────────────────
     {
-        GRPOTrainer trainer(config, &engine, (RewardFn)boxed_reward);
+        GRPOTrainer trainer(config, &engine, reward);
 
         printf("[grpo] Starting GRPO training for %d steps ...\n", config.total_steps);
         trainer.grpo_train();

@@ -118,6 +118,7 @@ add_model_test(test_fwd_bwd            tests/test_fwd_bwd.cu)
 add_model_test(test_adamw              tests/test_adamw.cu)
 add_model_test(test_kv_cache           tests/test_kv_cache.cu)
 add_model_test(test_llmengine          tests/test_llmengine.cu)
+add_model_test(test_rollout_kl          tests/test_rollout_kl.cu)
 
 # ── C++-only tests (no CUDA runtime needed) ──────────────────────────────────
 add_executable(test_dataloader tests/test_dataloader.cpp)

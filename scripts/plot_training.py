@@ -41,10 +41,14 @@ def main():
     comp_tokens = [r["comp_tokens"] for r in rows]
     step_ms     = [r["step_ms"] for r in rows]
     lrs         = [r["lr"] for r in rows]
+    kls         = [r.get("kl", 0.0) for r in rows]
+    has_kl      = any(k > 0 for k in kls)
 
     w = args.smooth
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    n_plots = 8 if has_kl else 6
+    n_cols  = 4 if has_kl else 3
+    fig, axes = plt.subplots(2, n_cols, figsize=(5 * n_cols, 9))
     fig.suptitle(f"GRPO Training ({len(rows)} steps)", fontsize=14, fontweight='bold')
 
     # 1. Mean Reward
@@ -117,6 +121,33 @@ def main():
     ax.ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
     ax.grid(True, alpha=0.3)
 
+    # 7-8. KL divergence (only if present in log)
+    if has_kl:
+        # 7. KL (linear scale)
+        ax = axes[0, 3]
+        ax.plot(steps, kls, alpha=0.25, color='C6', linewidth=0.5)
+        if len(kls) >= w:
+            s = smooth(kls, w)
+            ax.plot(steps[w-1:], s, color='C6', linewidth=1.5, label=f'smooth({w})')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('KL (per token)')
+        ax.set_title('KL to Reference')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # 8. KL (log scale)
+        ax = axes[1, 3]
+        kls_pos = [max(k, 1e-10) for k in kls]
+        ax.semilogy(steps, kls_pos, alpha=0.25, color='C6', linewidth=0.5)
+        if len(kls_pos) >= w:
+            s = smooth(kls_pos, w)
+            ax.semilogy(steps[w-1:], s, color='C6', linewidth=1.5, label=f'smooth({w})')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('KL (log scale)')
+        ax.set_title('KL to Reference (log)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
     plt.savefig(args.output, dpi=150, bbox_inches='tight')
     print(f"Saved to {args.output}")
@@ -129,6 +160,8 @@ def main():
     print(f"Grad Norm:    {np.mean(grad_norms):.3f}  (last 50: {np.mean(grad_norms[-50:]):.3f})")
     print(f"Step Time:    {np.mean(step_s):.1f}s  (total: {sum(step_s)/3600:.1f}h)")
     print(f"Comp Tokens:  {np.mean(comp_tokens):.0f}/step  (total: {sum(comp_tokens)/1e6:.1f}M)")
+    if has_kl:
+        print(f"KL:           {np.mean(kls):.5f}  (last 50: {np.mean(kls[-50:]):.5f})")
 
 
 if __name__ == "__main__":

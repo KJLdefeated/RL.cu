@@ -38,15 +38,32 @@
 // ============================================================
 
 // ============================================================
-// GRPO Loss Kernel
+// GRPO Loss Kernel (with optional KL penalty to reference model)
+//
+// Loss (per active token):
+//     L[t] = -adv[b] * log_p_new[t]  +  β * KL[t]
+//
+// KL estimator (Schulman, unbiased, always ≥ 0):
+//     Δ      = log_p_ref[t] - log_p_new[t]
+//     KL[t]  = exp(Δ) - Δ - 1
+//     ∂KL / ∂log_p_new = 1 - exp(Δ)
+//
+// So the upstream gradient on log_p_new[t] is:
+//     ∂L/∂log_p_new[t] = (-adv[b] + β * (1 - exp(Δ))) / N_active
+//
+// When beta==0, or log_p_ref is aliased to log_p_new, Δ=0 → KL=0 → the
+// kernel reduces to the plain REINFORCE form.
 // ============================================================
 
 __global__ static void grpo_loss_kernel(
     float*       __restrict__ grad,
-    const float* __restrict__ log_probs,
+    const float* __restrict__ log_probs,        // [T] new policy log p
+    const float* __restrict__ log_probs_ref,    // [T] reference log p (may alias log_probs)
     const int*   __restrict__ loss_mask,
-    const float* __restrict__ advantages,  // [B] per-sequence
-    float*       __restrict__ loss_sum,     // [1] atomic accumulator
+    const float* __restrict__ advantages,       // [B] per-sequence
+    float*       __restrict__ loss_sum,         // [1] atomic accumulator (policy + β·KL)
+    float*       __restrict__ kl_sum,           // [1] atomic accumulator (raw KL, no β)
+    float beta,
     int T, int S, int N_active
 ) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -55,10 +72,18 @@ __global__ static void grpo_loss_kernel(
     int b = t / S;
 
     if (loss_mask[t] && N_active > 0) {
-        float adv = advantages[b];
+        float adv   = advantages[b];
         float inv_n = 1.0f / (float)N_active;
-        grad[t] = -adv * inv_n;
-        atomicAdd(loss_sum, -adv * log_probs[t]);
+
+        // Schulman KL estimator
+        float delta     = log_probs_ref[t] - log_probs[t];
+        float exp_delta = expf(delta);
+        float kl        = exp_delta - delta - 1.0f;
+        float dkl       = 1.0f - exp_delta;        // ∂KL / ∂log_p_new
+
+        grad[t] = (-adv + beta * dkl) * inv_n;
+        atomicAdd(loss_sum, -adv * log_probs[t] + beta * kl);
+        atomicAdd(kl_sum,   kl);
     } else {
         grad[t] = 0.0f;
     }
@@ -78,6 +103,23 @@ struct GRPOConfig : public TrainingConfig {
     int gen_top_k          = 0;
 
     float advantage_eps    = 1e-8f;
+
+    // KL penalty against frozen initial (reference) weights.
+    // 0 → disabled (no ref forward pass, matches vanilla REINFORCE).
+    // Typical GRPO/DeepSeek values: 0.01 – 0.04.
+    float kl_beta          = 0.0f;
+
+    // Dynamic KL targeting (DAPO-style).
+    // When enabled, kl_beta is adjusted each step so that per-token KL
+    // stays near kl_target.  kl_beta is multiplied by (1 + kl_horizon)
+    // when KL > target, and divided by (1 + kl_horizon) when KL < target.
+    float kl_target        = 0.0f;  // 0 → disabled; typical: 0.02–0.05
+    float kl_horizon       = 0.05f; // adaptation rate (per-step max change fraction)
+
+    // Overlong filtering (DAPO): mask out completions that hit
+    // max_completion_len — they likely failed to produce an answer and
+    // would dilute the gradient signal.
+    bool  filter_overlong  = true;
 
     // Derived (call recompute() after changing batch_size / num_generations)
     int num_prompts        = 1;
@@ -128,21 +170,34 @@ public:
         load_dataset(config.train_data_path);
 
         CUDA_CHECK(cudaMalloc(&d_loss_sum_, sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_kl_sum_,   sizeof(float)));
+
+        // Snapshot initial weights as the frozen reference policy.
+        // Only done if KL penalty is enabled — costs ~1.2 GB for Qwen3-0.6B.
+        if (grpo_config_.kl_beta > 0.0f) {
+            ref_weights_ = snapshot_weights(engine_->model_runner->model->weights);
+            printf("[GRPOTrainer] KL ref snapshot: %.1f MB  (β=%.4f)\n",
+                   ref_weights_.total_bytes / (1024.0 * 1024.0),
+                   grpo_config_.kl_beta);
+        }
 
         // Sleep KV cache — free memory for training
         engine_->sleep();
 
         printf("[GRPOTrainer] batch_size=%d  num_prompts=%d  G=%d  "
-               "grad_accum=%d  max_completion=%d  dataset=%zu samples\n",
+               "grad_accum=%d  max_completion=%d  kl_beta=%.4f  dataset=%zu samples\n",
                config_.batch_size, grpo_config_.num_prompts,
                grpo_config_.num_generations, config_.grad_accum_steps,
-               grpo_config_.max_completion_len,
+               grpo_config_.max_completion_len, grpo_config_.kl_beta,
                dataset_.size());
     }
 
     ~GRPOTrainer() override {
-        if (d_loss_sum_)    cudaFree(d_loss_sum_);
-        if (d_advantages_)  cudaFree(d_advantages_);
+        if (d_loss_sum_)       cudaFree(d_loss_sum_);
+        if (d_kl_sum_)         cudaFree(d_kl_sum_);
+        if (d_advantages_)     cudaFree(d_advantages_);
+        if (d_log_probs_ref_)  cudaFree(d_log_probs_ref_);
+        free_weight_snapshot(ref_weights_);
     }
 
     // ================================================================
@@ -160,7 +215,7 @@ public:
 
         for (int epoch = 0; epoch < config_.num_epochs; epoch++) {
             std::mt19937_64 rng((uint64_t)(epoch + 42));
-            // std::shuffle(indices.begin(), indices.end(), rng);
+            std::shuffle(indices.begin(), indices.end(), rng);
 
             for (size_t cursor = 0; cursor + B <= N; cursor += B) {
                 if (global_step >= config_.total_steps) break;
@@ -201,12 +256,19 @@ public:
 
                 // Metrics
                 float mean_reward = 0;
-                for (float r : rewards) mean_reward += r;
+                int n_correct = 0;
+                for (float r : rewards) {
+                    mean_reward += r;
+                    if (r > 0.5f) n_correct++;
+                }
                 mean_reward /= (float)rewards.size();
+                float frac_correct = (float)n_correct / (float)rewards.size();
 
                 int total_comp_tokens = 0;
                 for (auto& gen : gens)
                     total_comp_tokens += (int)gen.completion_tokens.size();
+                float mean_comp_len = (float)total_comp_tokens / (float)gens.size();
+                float frac_overlong = (float)last_n_overlong_ / (float)gens.size();
 
                 global_step++;
 
@@ -216,6 +278,11 @@ public:
                 logger_.log(global_step, "mean_reward",   mean_reward);
                 logger_.log(global_step, "step_ms",       step_ms);
                 logger_.log(global_step, "comp_tokens",   (float)total_comp_tokens);
+                logger_.log(global_step, "kl",            last_kl_);
+                logger_.log(global_step, "kl_beta",       grpo_config_.kl_beta);
+                logger_.log(global_step, "frac_correct",  frac_correct);
+                logger_.log(global_step, "frac_overlong", frac_overlong);
+                logger_.log(global_step, "mean_comp_len", mean_comp_len);
 
                 if (global_step % config_.logging_steps == 0)
                     logger_.commit(global_step);
@@ -244,9 +311,87 @@ private:
     std::vector<GRPOSample> dataset_;  // raw text prompts + answers
 
     // Device buffers
-    float*      d_loss_sum_    = nullptr;
-    float*      d_advantages_  = nullptr;
-    int         d_adv_cap_     = 0;
+    float*      d_loss_sum_       = nullptr;
+    float*      d_kl_sum_         = nullptr;
+    float*      d_advantages_     = nullptr;
+    int         d_adv_cap_        = 0;
+    float*      d_log_probs_ref_  = nullptr;   // [micro_T] ref policy log-probs
+    int         d_lpref_cap_      = 0;
+
+    // Frozen reference weights (only allocated when kl_beta > 0)
+    Qwen3Weights ref_weights_;
+
+    // Running KL (per-token, averaged over global batch) for the most recent step
+    float last_kl_ = 0.0f;
+
+    // Overlong count from the most recent build_train_batch
+    int last_n_overlong_ = 0;
+
+    // ================================================================
+    // Weight snapshot / restore helpers (used for KL-to-ref forward pass)
+    // ================================================================
+    //
+    // Qwen3Weights carries two flat pools (fp16_pool, fp32_pool) plus a set
+    // of convenience pointers that index into them.  To snapshot, we dup both
+    // pools with a D2D copy and rebase every convenience pointer to the new
+    // pool via offset arithmetic.
+    static Qwen3Weights snapshot_weights(const Qwen3Weights& src) {
+        Qwen3Weights dst;
+        dst.fp16_pool_elems = src.fp16_pool_elems;
+        dst.fp32_pool_elems = src.fp32_pool_elems;
+        dst.total_bytes     = src.total_bytes;
+        dst.layers          = src.layers;   // shallow copy; relocated below
+
+        size_t fp16_bytes = src.fp16_pool_elems * sizeof(half);
+        size_t fp32_bytes = src.fp32_pool_elems * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&dst.fp16_pool, fp16_bytes));
+        CUDA_CHECK(cudaMalloc(&dst.fp32_pool, fp32_bytes));
+        CUDA_CHECK(cudaMemcpy(dst.fp16_pool, src.fp16_pool, fp16_bytes,
+                              cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(dst.fp32_pool, src.fp32_pool, fp32_bytes,
+                              cudaMemcpyDeviceToDevice));
+
+        auto reloc_h = [&](half* p) -> half* {
+            return p ? dst.fp16_pool + (p - src.fp16_pool) : nullptr;
+        };
+        auto reloc_f = [&](float* p) -> float* {
+            return p ? dst.fp32_pool + (p - src.fp32_pool) : nullptr;
+        };
+
+        dst.embed_tokens = reloc_h(src.embed_tokens);
+        dst.lm_head      = reloc_h(src.lm_head);
+        dst.final_norm   = reloc_f(src.final_norm);
+
+        for (size_t l = 0; l < dst.layers.size(); l++) {
+            auto& lw = dst.layers[l];
+            lw.q_proj       = reloc_h(lw.q_proj);
+            lw.k_proj       = reloc_h(lw.k_proj);
+            lw.v_proj       = reloc_h(lw.v_proj);
+            lw.qkv_proj     = reloc_h(lw.qkv_proj);
+            lw.o_proj       = reloc_h(lw.o_proj);
+            lw.gate_proj    = reloc_h(lw.gate_proj);
+            lw.up_proj      = reloc_h(lw.up_proj);
+            lw.gate_up_proj = reloc_h(lw.gate_up_proj);
+            lw.down_proj    = reloc_h(lw.down_proj);
+            lw.input_layernorm     = reloc_f(lw.input_layernorm);
+            lw.q_norm              = reloc_f(lw.q_norm);
+            lw.k_norm              = reloc_f(lw.k_norm);
+            lw.post_attn_layernorm = reloc_f(lw.post_attn_layernorm);
+        }
+        return dst;
+    }
+
+    static void free_weight_snapshot(Qwen3Weights& w) {
+        if (w.fp16_pool) { cudaFree(w.fp16_pool); w.fp16_pool = nullptr; }
+        if (w.fp32_pool) { cudaFree(w.fp32_pool); w.fp32_pool = nullptr; }
+        w.embed_tokens = nullptr;
+        w.lm_head      = nullptr;
+        w.final_norm   = nullptr;
+        w.layers.clear();
+        w.fp16_pool_elems = 0;
+        w.fp32_pool_elems = 0;
+        w.total_bytes     = 0;
+    }
 
     // ================================================================
     // Load dataset from JSONL: {"prompt": "...", "answer": "..."}
@@ -419,6 +564,7 @@ private:
         batch.seq_lens.resize(total_seqs);
         batch.prompt_lens.resize(total_seqs);
 
+        int n_overlong = 0;
         for (int b = 0; b < total_seqs; b++) {
             auto& gen = gens[b];
             int plen = (int)gen.prompt_tokens.size();
@@ -437,17 +583,29 @@ private:
             for (int t = 0; t < total_len - 1; t++)
                 batch.target_ids[b * S + t] = batch.token_ids[b * S + t + 1];
 
+            // Overlong filtering (DAPO): skip completions that hit max length.
+            // These almost certainly failed to produce an answer and would
+            // dilute the gradient with noise.
+            bool is_overlong = grpo_config_.filter_overlong &&
+                               (clen >= grpo_config_.max_completion_len);
+            if (is_overlong) {
+                n_overlong++;
+                // loss_mask stays all-zero → this seq contributes no gradient
+                continue;
+            }
+
             // Loss mask: completion tokens only (positions predicting tokens >= plen)
             int loss_start = std::max(0, plen - 1);
             for (int t = loss_start; t < total_len - 1; t++)
                 batch.loss_mask[b * S + t] = 1;
         }
 
+        last_n_overlong_ = n_overlong;
         return batch;
     }
 
     // ================================================================
-    // GRPO training step with DAPO normalization
+    // GRPO training step with DAPO normalization + optional KL-to-ref
     // ================================================================
     float grpo_training_step(TrainBatch& global_batch,
                              const std::vector<float>& advantages) {
@@ -464,10 +622,14 @@ private:
         for (int v : global_batch.loss_mask) N_active += v;
 
         ensure_advantage_buf(B);
+        const bool use_kl = (grpo_config_.kl_beta > 0.0f) &&
+                            (ref_weights_.fp16_pool != nullptr);
+        if (use_kl) ensure_log_probs_ref_buf(micro_T);
 
         qwen3_gradients_zero(grads_);
 
         float total_loss = 0.0f;
+        float total_kl   = 0.0f;
 
         for (int acc = 0; acc < acc_steps; acc++) {
             const int* tokens  = global_batch.token_ids.data()  + acc * micro_T;
@@ -484,21 +646,44 @@ private:
             CUDA_CHECK(cudaMemcpy(d_advantages_, micro_adv.data(),
                                   B * sizeof(float), cudaMemcpyHostToDevice));
 
-            // Forward
+            // --- 1. Reference forward (frozen initial weights) ---
+            // Must run BEFORE the training forward because both share the
+            // same Qwen3TrainState; the training forward leaves the state
+            // populated with activations needed for backward, while the
+            // reference forward would overwrite them.
+            if (use_kl) {
+                Qwen3Weights saved = model_->weights;
+                model_->weights    = ref_weights_;
+                qwen3_forward(model_, state_, tokens, targets,
+                              d_log_probs_ref_, B, S);
+                model_->weights    = saved;
+            }
+
+            // --- 2. Training forward (current weights) ---
             qwen3_forward(model_, state_, tokens, targets, d_log_probs_, B, S);
 
-            // GRPO gradient
+            // --- 3. GRPO gradient (+ KL if enabled) ---
             CUDA_CHECK(cudaMemset(d_loss_sum_, 0, sizeof(float)));
+            CUDA_CHECK(cudaMemset(d_kl_sum_,   0, sizeof(float)));
             int block = 256;
             int grid  = (micro_T + block - 1) / block;
-            grpo_loss_kernel<<<grid, block>>>(
-                d_loss_grad_, d_log_probs_, d_loss_mask_, d_advantages_,
-                d_loss_sum_, micro_T, S, N_active);
 
-            float micro_loss;
+            // When KL is off, alias ref to new so Δ=0 → KL=0 → identical
+            // numerics to the old plain-REINFORCE kernel.
+            const float* lp_ref = use_kl ? d_log_probs_ref_ : d_log_probs_;
+            grpo_loss_kernel<<<grid, block>>>(
+                d_loss_grad_, d_log_probs_, lp_ref,
+                d_loss_mask_, d_advantages_,
+                d_loss_sum_, d_kl_sum_,
+                grpo_config_.kl_beta, micro_T, S, N_active);
+
+            float micro_loss, micro_kl;
             CUDA_CHECK(cudaMemcpy(&micro_loss, d_loss_sum_,
                                   sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&micro_kl, d_kl_sum_,
+                                  sizeof(float), cudaMemcpyDeviceToHost));
             total_loss += micro_loss;
+            total_kl   += micro_kl;
 
             // Backward (accumulates into grads_)
             qwen3_backward(model_, state_, grads_, d_loss_grad_);
@@ -513,6 +698,26 @@ private:
         // Optimizer step
         optimizer_.step(grads_);
 
+        last_kl_ = (N_active > 0) ? total_kl / N_active : 0.0f;
+
+        // Dynamic KL targeting: adapt kl_beta to keep KL near target.
+        // Proportional controller: adjust beta based on how far KL is from target,
+        // with a soft rate limit (kl_horizon) to prevent oscillation.
+        if (grpo_config_.kl_target > 0.0f && grpo_config_.kl_beta > 0.0f) {
+            float ratio = last_kl_ / (grpo_config_.kl_target + 1e-8f);
+            // Smooth proportional update: nudge beta toward beta * ratio,
+            // but limit the per-step change to ±kl_horizon fraction.
+            float log_ratio = logf(std::max(0.1f, std::min(10.0f, ratio)));
+            float delta = grpo_config_.kl_horizon * log_ratio;
+            delta = std::max(-grpo_config_.kl_horizon, std::min(grpo_config_.kl_horizon, delta));
+            grpo_config_.kl_beta *= expf(delta);
+            // Clamp: beta in [initial/10, initial*2] to prevent runaway.
+            // Upper bound of 2x keeps KL penalty from dominating the reward signal.
+            float init_beta = grpo_config_.kl_target;  // use target as reference scale
+            grpo_config_.kl_beta = std::max(init_beta * 0.1f,
+                                            std::min(init_beta * 2.0f, grpo_config_.kl_beta));
+        }
+
         return (N_active > 0) ? total_loss / N_active : 0.0f;
     }
 
@@ -525,5 +730,12 @@ private:
         if (d_advantages_) cudaFree(d_advantages_);
         CUDA_CHECK(cudaMalloc(&d_advantages_, B * sizeof(float)));
         d_adv_cap_ = B;
+    }
+
+    void ensure_log_probs_ref_buf(int micro_T) {
+        if (micro_T <= d_lpref_cap_) return;
+        if (d_log_probs_ref_) cudaFree(d_log_probs_ref_);
+        CUDA_CHECK(cudaMalloc(&d_log_probs_ref_, micro_T * sizeof(float)));
+        d_lpref_cap_ = micro_T;
     }
 };
