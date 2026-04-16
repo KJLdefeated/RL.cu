@@ -4,7 +4,7 @@
     <b>LLM Reinforcement Learning in Pure CUDA — From Kernels to GRPO</b>
   </p>
   <p align="center">
-    Zero PyTorch. One GPU. Full RL loop.
+    Zero PyTorch. Full RL loop. 1.37x faster than TRL with vLLM.
   </p>
 </p>
 
@@ -17,6 +17,14 @@
   <a href="#architecture">Architecture</a> &bull;
   <a href="#license">License</a> &bull;
   <a href="#develop-with-claude-code">Claude Code</a>
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/grpo_comparison.png" width="700" alt="RL.cu vs TRL: reward and step time"/>
+  <br>
+  <em>GRPO training on DeepMath-103K (Qwen3-0.6B, same GPU) — 1.37x faster wall-clock, matching reward</em>
 </p>
 
 ---
@@ -190,16 +198,27 @@ For each step:
 
 94% of nano-vllm throughput (7,411 tok/s). See [docs/ENGINE.md](docs/ENGINE.md) for the full optimization journey.
 
-### GRPO Training (Qwen3-0.6B, 8 prompts x 8 generations)
+### GRPO Training (Qwen3-0.6B, 8 prompts x 8 generations, DeepMath-103K)
 
-| Metric | Value |
-|--------|------:|
-| Generation throughput | 3,834 tok/s |
-| Activation memory (with checkpointing) | 6.4 GB |
-| Activation memory (without checkpointing) | 61 GB |
-| Training step time | ~107s |
+**RL.cu vs TRL (w/ vLLM) on the same task, same GPU (RTX PRO 6000):**
 
-Note: Long context generation cause generation throughput degrade, we need to implement FlashDecoding KV-Split for handling long context.
+<p align="center">
+  <img src="assets/training_comparison.png" width="900" alt="RL.cu vs TRL training curves"/>
+</p>
+
+| Metric | RL.cu | TRL (vLLM backend) |
+|--------|------:|-------------------:|
+| Reward (last 100 steps) | 0.307 | 0.312 |
+| Step time | **33.7s** | 46.3s |
+| Generation throughput | **2,992 tok/s** | 2,602 tok/s |
+| Wall time (903 steps) | **8.5h** | 11.6h |
+| Time to reward = 0.3 | **0.8h** | 2.9h |
+
+**Why RL.cu is 1.37x faster (wall-clock) for the same number of steps:**
+
+1. **15% faster generation** (2,992 vs 2,602 tok/s at matched token counts) — CUDA graphs, fused QKV/gate-up projections, and zero Python overhead eliminate per-step launch costs
+2. **No weight transfer** — RL.cu runs inference and training in the same process with shared weights; TRL must sync weights between the training model and vLLM's inference copy every step
+3. **Shorter completions over training** — RL.cu's completions shrink from 1,889 → 968 tokens as the model learns concise answers, reducing generation work by ~50%; TRL stays at ~1,840 tokens throughout
 
 ## Architecture
 
