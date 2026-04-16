@@ -42,14 +42,13 @@ $(BUILDDIR)/%: configure
 
 KERNEL_TESTS := test_rmsnorm test_softmax test_swiglu test_attention \
                 test_rope test_embedding test_linear test_sampler \
-                test_fused_norm_linear test_kv_cache
+                test_fused_norm_linear test_kv_cache test_adamw test_fwd_bwd
 
 BACKWARD_TESTS := test_linear_backward test_embedding_backward \
                   test_rmsnorm_backward test_swiglu_backward \
                   test_rope_backward test_attention_backward
 
-MODEL_TESTS := test_qwen3 test_qwen3_forward test_qwen3_backward \
-               test_fwd_bwd test_adamw test_llmengine
+MODEL_TESTS := test_qwen3_backward test_llmengine
 
 CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights
 
