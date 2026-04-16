@@ -250,7 +250,10 @@ RL.cu
 │   ├── tokenizer.h       #   BPE tokenizer (reads HF tokenizer.json)
 │   ├── config.h          #   Model + engine config
 │   └── weights.h         #   Safetensors loader (mmap)
-└── tests/                # 26 test files, each kernel validated independently
+└── tests/
+    ├── kernels/          # Unit tests for individual CUDA kernels
+    ├── models/           # End-to-end model tests (Qwen3, LLMEngine)
+    └── training/         # Training loop tests (SFT, GRPO)
 ```
 
 ## Comparison
@@ -270,20 +273,27 @@ RL.cu
 
 ## Tests
 
-Every component has a standalone test. Run all tests:
+Tests are organized into three directories:
+
+| Directory | Contents |
+|-----------|----------|
+| `tests/kernels/` | Unit tests for individual CUDA kernels (forward + backward) |
+| `tests/models/` | End-to-end model tests (Qwen3, LLMEngine integration) |
+| `tests/training/` | Training loop tests (SFT, GRPO) |
+
 ```bash
+# Run all tests
 make tests
+
+# Run a single test
+make test_attention       # FlashAttention-2 fwd+bwd
+make test_llmengine       # Full engine (11 integration tests)
+
+# Profile a kernel with Nsight Systems
+nsys profile --trace=cuda,cublas --stats=true ./build/test_attention
 ```
 
-Or run individually:
-```bash
-make build/test_attention && ./build/test_attention      # FlashAttention-2 fwd+bwd
-make build/test_rmsnorm  && ./build/test_rmsnorm         # RMSNorm
-make build/test_rope     && ./build/test_rope            # RoPE
-make build/test_sampler  && ./build/test_sampler          # Top-k/p sampling
-make build/test_llmengine && ./build/test_llmengine model_weights/Qwen3-0.6B  # Full engine
-# ... 26 tests total
-```
+See [tests/README.md](tests/README.md) for full profiling guide.
 
 ## Develop with Claude Code
 

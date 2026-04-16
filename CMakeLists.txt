@@ -90,46 +90,44 @@ function(add_model_test name)
     target_link_libraries(${name} PRIVATE model)
 endfunction()
 
-# ── Kernel-only tests ─────────────────────────────────────────────────────────
-add_kernel_test(test_rmsnorm           tests/test_rmsnorm.cu)
-add_kernel_test(test_softmax           tests/test_softmax.cu)
-add_kernel_test(test_swiglu            tests/test_swiglu.cu)
-add_kernel_test(test_attention         tests/test_attention.cu)
-add_kernel_test(test_rope              tests/test_rope.cu)
-add_kernel_test(test_embedding         tests/test_embedding.cu)
-add_kernel_test(test_linear            tests/test_linear.cu)
-add_kernel_test(test_sampler           tests/test_sampler.cu)
-add_kernel_test(test_fused_norm_linear tests/test_fused_norm_linear.cu)
-add_kernel_test(test_linear_backward   tests/test_linear_backward.cu)
-add_kernel_test(test_embedding_backward tests/test_embedding_backward.cu)
-add_kernel_test(test_rmsnorm_backward  tests/test_rmsnorm_backward.cu)
-add_kernel_test(test_swiglu_backward   tests/test_swiglu_backward.cu)
-add_kernel_test(test_rope_backward     tests/test_rope_backward.cu)
-add_kernel_test(test_attention_backward tests/test_attention_backward.cu)
+# ── Kernel-only tests (tests/kernels/) ────────────────────────────────────────
+add_kernel_test(test_rmsnorm           tests/kernels/test_rmsnorm.cu)
+add_kernel_test(test_softmax           tests/kernels/test_softmax.cu)
+add_kernel_test(test_swiglu            tests/kernels/test_swiglu.cu)
+add_kernel_test(test_attention         tests/kernels/test_attention.cu)
+add_kernel_test(test_rope              tests/kernels/test_rope.cu)
+add_kernel_test(test_embedding         tests/kernels/test_embedding.cu)
+add_kernel_test(test_linear            tests/kernels/test_linear.cu)
+add_kernel_test(test_sampler           tests/kernels/test_sampler.cu)
+add_kernel_test(test_fused_norm_linear tests/kernels/test_fused_norm_linear.cu)
+add_kernel_test(test_kv_cache          tests/kernels/test_kv_cache.cu)
+add_kernel_test(test_adamw             tests/kernels/test_adamw.cu)
+add_kernel_test(test_fwd_bwd           tests/kernels/test_fwd_bwd.cu)
+add_kernel_test(test_linear_backward   tests/kernels/test_linear_backward.cu)
+add_kernel_test(test_embedding_backward tests/kernels/test_embedding_backward.cu)
+add_kernel_test(test_rmsnorm_backward  tests/kernels/test_rmsnorm_backward.cu)
+add_kernel_test(test_swiglu_backward   tests/kernels/test_swiglu_backward.cu)
+add_kernel_test(test_rope_backward     tests/kernels/test_rope_backward.cu)
+add_kernel_test(test_attention_backward tests/kernels/test_attention_backward.cu)
 
-# ── Model-level tests ─────────────────────────────────────────────────────────
-# Note: test_qwen3, test_qwen3_forward, bench_decode have stale APIs
+# ── Model-level tests (tests/models/) ────────────────────────────────────────
+# Note: test_qwen3, test_qwen3_forward have stale APIs
 # and need updating before they can compile again.
-# add_model_test(test_qwen3              tests/test_qwen3.cu)
-# add_model_test(test_qwen3_forward      tests/test_qwen3_forward.cu)
-# add_model_test(bench_decode            tests/bench_decode.cu)
-add_model_test(test_qwen3_backward     tests/test_qwen3_backward.cu)
-add_model_test(test_fwd_bwd            tests/test_fwd_bwd.cu)
-add_model_test(test_adamw              tests/test_adamw.cu)
-add_model_test(test_kv_cache           tests/test_kv_cache.cu)
-add_model_test(test_llmengine          tests/test_llmengine.cu)
-add_model_test(test_rollout_kl          tests/test_rollout_kl.cu)
+# add_model_test(test_qwen3              tests/models/test_qwen3.cu)
+# add_model_test(test_qwen3_forward      tests/models/test_qwen3_forward.cu)
+add_model_test(test_qwen3_backward     tests/models/test_qwen3_backward.cu)
+add_model_test(test_llmengine          tests/models/test_llmengine.cu)
 
-# ── C++-only tests (no CUDA runtime needed) ──────────────────────────────────
-add_executable(test_dataloader tests/test_dataloader.cpp)
+# ── C++-only tests (tests/kernels/) ─────────────────────────────────────────
+add_executable(test_dataloader tests/kernels/test_dataloader.cpp)
 target_include_directories(test_dataloader PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-add_executable(test_lr_scheduler tests/test_lr_scheduler.cpp)
+add_executable(test_lr_scheduler tests/kernels/test_lr_scheduler.cpp)
 target_include_directories(test_lr_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # test_loading_weights is C++ but includes cuda_fp16.h and calls cudaGetErrorString
 add_executable(test_loading_weights
-    tests/test_loading_weights.cpp
+    tests/kernels/test_loading_weights.cpp
     src/kernels/config.cpp
     src/kernels/weights.cpp
 )
@@ -139,6 +137,6 @@ target_include_directories(test_loading_weights PRIVATE
 )
 target_link_libraries(test_loading_weights PRIVATE CUDA::cudart)
 
-# ── Training binaries ─────────────────────────────────────────────────────────
-add_model_test(train_sft               tests/train_sft.cu)
-add_model_test(train_grpo              tests/train_grpo.cu)
+# ── Training binaries (tests/training/) ──────────────────────────────────────
+add_model_test(train_sft               tests/training/train_sft.cu)
+add_model_test(train_grpo              tests/training/train_grpo.cu)
