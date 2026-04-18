@@ -9,7 +9,8 @@ Implementation notes for `src/kernels/attention.cu` in grpo-cuda.
 | Mode | Kernel | When | Bottleneck |
 |------|--------|------|------------|
 | **Prefill** | `flash_attention_prefill_kernel` | Processing prompt tokens | Compute (FLOPS) |
-| **Decode** | `paged_attention_decode_kernel` | Token-by-token generation | Memory bandwidth |
+| **Decode** | `paged_attention_decode_warp_kernel` | Decode, large batch | Memory bandwidth |
+| **Decode Split-K** | `flash_decode_splitk_kernel` + `flash_decode_reduce_kernel` | Decode, small batch / long context | Memory bandwidth |
 | **Bwd dQ** | `flash_attention_bwd_dq_wmma_kernel` | Training backward | Compute |
 | **Bwd dKdV** | `flash_attention_bwd_dkdv_wmma_kernel` | Training backward | Compute |
 
@@ -316,7 +317,101 @@ B=1 is latency-bound (only 16 SMs active); B=128 reaches ~60% of 1700 GB/s HBM p
 
 ---
 
-## 7. Correctness Tests
+## 7. Optimization 3: Flash Decoding (Split-K)
+
+### Problem
+
+The warp-parallel decode kernel launches **one thread block per (seq, head)**.
+At small batch sizes, this massively underutilizes the GPU:
+
+```
+B=1, H_q=16 → 16 thread blocks on a 128-SM GPU → 88% idle
+B=1, ctx=2048 → each warp processes 256 tokens serially → high latency
+```
+
+Even at moderate batches, each block does too much serial work per warp,
+leaving memory latency unhidden.
+
+### Fix: Split the KV dimension across multiple thread blocks
+
+Two new kernels in `src/kernels/attention.cu`:
+
+**Kernel 1:** `flash_decode_splitk_kernel<HEAD_DIM=128, BLOCK_SIZE=16, NUM_WARPS=4>`
+
+```
+Grid:  (num_seqs, H_q, num_splits)   ← new split dimension
+Block: (128)                          — 4 warps × 32 threads
+```
+
+Each block handles a contiguous range of KV blocks for one (seq, head).
+Warps within the block subdivide that range in strided fashion (same pattern
+as the original kernel). Each block writes per-split partial softmax state
+to global memory:
+
+```
+partial_out [num_seqs, H_q, num_splits, HEAD_DIM]  — FP32
+partial_max [num_seqs, H_q, num_splits]             — FP32
+partial_sum [num_seqs, H_q, num_splits]             — FP32
+```
+
+**Kernel 2:** `flash_decode_reduce_kernel<HEAD_DIM=128>`
+
+```
+Grid:  (num_seqs, H_q)
+Block: (32) — one warp
+```
+
+Merges all `num_splits` partials via online softmax rescaling and writes
+the final `half[HEAD_DIM]` output. Numerically identical to full-context
+attention — online softmax is associative.
+
+### Auto-Selection Heuristic
+
+The launcher in `qwen3_layer_forward` selects `num_splits` based on GPU occupancy:
+
+```
+total_heads = B × H_q
+  ≤ 32  → num_splits = 16    (B ≤ 2  for Qwen3)
+  ≤ 128 → num_splits = 8     (B ≤ 8)
+  > 128 → num_splits = 1     (fallback to original kernel)
+```
+
+At large batches the original warp-parallel kernel is faster (no global
+partial writes or extra kernel launch overhead).
+
+### Workspace
+
+Pre-allocated in `Qwen3Model` at init time:
+
+```
+d_splitk_out: [max_batch × H_q × 16 × HEAD_DIM] floats  (~16 MB at max_batch=256)
+d_splitk_max: [max_batch × H_q × 16] floats
+d_splitk_sum: [max_batch × H_q × 16] floats
+```
+
+### Kernel Microbenchmarks (Qwen3 config, H_q=16, H_kv=8, HEAD_DIM=128, sm_120)
+
+| Config | Old (us) | Split-K (us) | Speedup | Split-K GB/s |
+|---|---|---|---|---|
+| B=1   ctx=512  | 22.5 | **12.3** | **1.83x** | 171 |
+| B=1   ctx=2048 | 82.0 | **16.4** | **5.0x**  | 512 |
+| B=16  ctx=2048 | 87.6 | **65.9** | **1.33x** | 2038 |
+| B=64  ctx=2048 | 467  | 407      | 1.15x     | 1321 |
+| B=128 ctx=2048 | 926  | 810      | 1.14x     | 1328 |
+
+### End-to-End LLMEngine (Qwen3-0.6B, realistic benchmark, sm_120)
+
+| Config | Old (tok/s) | Split-K (tok/s) | Improvement |
+|---|---|---|---|
+| 128 seqs, ctx~2048 | 3532 | **3828** | **+8.4%** |
+| 256 seqs, ctx~4096 | 1890 | **1993** | **+5.4%** |
+
+Gains come primarily from ramp-up/drain phases of continuous batching
+when fewer sequences are active and the GPU would otherwise be starved.
+
+---
+
+## 8. Correctness Tests
 
 **Forward** (`make test_attention`): `max_err < 5e-3` vs CPU FP32 naive reference.
 
@@ -328,6 +423,12 @@ B=1 is latency-bound (only 16 SMs active); B=128 reaches ~60% of 1700 GB/s HBM p
 [PASS] Prefill B=1 S=256  H_q=16 H_kv=8   max_err=0.000164
 [PASS] Decode  num_seqs=1 ctx=32           max_err=0.000058
 [PASS] Decode  num_seqs=4 ctx=128          max_err=0.000030
+[PASS] SplitK  num_seqs=1 ctx=32   splits=2   max_err=0.000034
+[PASS] SplitK  num_seqs=1 ctx=128  splits=4   max_err=0.000030
+[PASS] SplitK  num_seqs=2 ctx=64   splits=4   max_err=0.000049
+[PASS] SplitK  num_seqs=4 ctx=128  splits=8   max_err=0.000030
+[PASS] SplitK  num_seqs=1 ctx=2048 splits=16  max_err=0.000012
+[PASS] SplitK  num_seqs=16 ctx=2048 splits=16 max_err=0.000015
 ```
 
 **Backward** (`make test_attention_backward`): `max_err < 5e-2` vs CPU FP32 reference.
@@ -342,7 +443,7 @@ B=1 is latency-bound (only 16 SMs active); B=128 reaches ~60% of 1700 GB/s HBM p
 
 ---
 
-## 8. Remaining Optimization Roadmap
+## 9. Remaining Optimization Roadmap
 
 ### Forward (6.2 ms/call, 44 TFLOPS, target ~1 ms / ~400 TFLOPS)
 

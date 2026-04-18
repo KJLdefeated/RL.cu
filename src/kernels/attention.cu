@@ -515,6 +515,222 @@ __global__ void paged_attention_decode_warp_kernel(
 }
 
 // =============================================================================
+// Flash Decoding Split-K — Kernel 1: Partial Attention per Split
+// =============================================================================
+//
+// Grid:  (num_seqs, H_q, num_splits)
+// Block: (NUM_WARPS * 32)
+//
+// Each block handles a contiguous range of KV blocks for one (seq, head).
+// Warps within the block further subdivide that range in strided fashion.
+// Outputs per-split partial softmax state to global memory:
+//   partial_out [num_seqs, H_q, num_splits, HEAD_DIM]  — FP32
+//   partial_max [num_seqs, H_q, num_splits]             — FP32
+//   partial_sum [num_seqs, H_q, num_splits]             — FP32
+
+template<int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void flash_decode_splitk_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float*      __restrict__ partial_out,
+    float*      __restrict__ partial_max,
+    float*      __restrict__ partial_sum,
+    const int*  __restrict__ block_tables,
+    const int*  __restrict__ seq_lens,
+    float scale,
+    int max_blocks_per_seq,
+    int H_q, int H_kv,
+    int num_splits
+) {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be divisible by 32");
+    constexpr int ELEMS = HEAD_DIM / 32;
+
+    const int seq_idx  = blockIdx.x;
+    const int h_q      = blockIdx.y;
+    const int split_id = blockIdx.z;
+    const int lane     = threadIdx.x % 32;
+    const int warp_id  = threadIdx.x / 32;
+    const int h_kv     = h_q * H_kv / H_q;
+
+    const int context_len = seq_lens[seq_idx];
+    const int num_blocks  = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Divide KV blocks evenly across splits
+    const int blocks_per_split = (num_blocks + num_splits - 1) / num_splits;
+    const int split_start      = split_id * blocks_per_split;
+    const int split_end        = min(split_start + blocks_per_split, num_blocks);
+
+    // Load Q into registers (same for all warps/splits in this head)
+    float q_reg[ELEMS];
+    {
+        const half* q_ptr = q + (seq_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        const int2  raw   = *reinterpret_cast<const int2*>(q_ptr);
+        const half2 lo    = *reinterpret_cast<const half2*>(&raw.x);
+        const half2 hi    = *reinterpret_cast<const half2*>(&raw.y);
+        const float2 lo_f = __half22float2(lo);
+        const float2 hi_f = __half22float2(hi);
+        q_reg[0] = lo_f.x;  q_reg[1] = lo_f.y;
+        q_reg[2] = hi_f.x;  q_reg[3] = hi_f.y;
+    }
+
+    // Per-warp partial softmax state
+    float warp_max = -INFINITY;
+    float warp_sum = 0.0f;
+    float warp_acc[ELEMS];
+    #pragma unroll
+    for (int d = 0; d < ELEMS; d++) warp_acc[d] = 0.0f;
+
+    const int* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Warp-strided iteration over this split's KV blocks
+    for (int blk = split_start + warp_id; blk < split_end; blk += NUM_WARPS) {
+        const int physical_block  = seq_block_table[blk];
+        const int tokens_in_block = min(BLOCK_SIZE, context_len - blk * BLOCK_SIZE);
+        const long block_base =
+            ((long)physical_block * H_kv + h_kv) * BLOCK_SIZE * HEAD_DIM;
+
+        for (int tok = 0; tok < tokens_in_block; tok++) {
+            const half* k_ptr = k_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+            const half* v_ptr = v_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+
+            const int2   k_raw = *reinterpret_cast<const int2*>(k_ptr);
+            const float2 k_lo  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.x));
+            const float2 k_hi  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.y));
+
+            float partial = q_reg[0] * k_lo.x + q_reg[1] * k_lo.y
+                          + q_reg[2] * k_hi.x + q_reg[3] * k_hi.y;
+
+            #pragma unroll
+            for (int mask = 16; mask >= 1; mask >>= 1)
+                partial += __shfl_xor_sync(0xFFFFFFFF, partial, mask);
+            const float score = partial * scale;
+
+            const float new_max = fmaxf(warp_max, score);
+            const float alpha   = expf(warp_max - new_max);
+            const float p       = expf(score - new_max);
+            warp_sum = warp_sum * alpha + p;
+            warp_max = new_max;
+
+            const int2   v_raw = *reinterpret_cast<const int2*>(v_ptr);
+            const float2 v_lo  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.x));
+            const float2 v_hi  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.y));
+            warp_acc[0] = warp_acc[0] * alpha + p * v_lo.x;
+            warp_acc[1] = warp_acc[1] * alpha + p * v_lo.y;
+            warp_acc[2] = warp_acc[2] * alpha + p * v_hi.x;
+            warp_acc[3] = warp_acc[3] * alpha + p * v_hi.y;
+        }
+    }
+
+    // --- Cross-warp merge within this split (same as original kernel) ---
+    extern __shared__ float smem[];
+    float* smem_max = smem;
+    float* smem_sum = smem_max + NUM_WARPS;
+    float* smem_acc = smem_sum + NUM_WARPS;
+
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++)
+        smem_acc[warp_id * HEAD_DIM + lane * ELEMS + e] = warp_acc[e];
+
+    if (lane == 0) {
+        smem_max[warp_id] = warp_max;
+        smem_sum[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    // Warp 0 merges all warps and writes split partial to global memory
+    if (warp_id == 0) {
+        float global_max = smem_max[0];
+        #pragma unroll
+        for (int w = 1; w < NUM_WARPS; w++)
+            global_max = fmaxf(global_max, smem_max[w]);
+
+        float global_sum = 0.0f;
+        float final_acc[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) final_acc[e] = 0.0f;
+
+        #pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++) {
+            const float alpha = expf(smem_max[w] - global_max);
+            global_sum += smem_sum[w] * alpha;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                final_acc[e] += smem_acc[w * HEAD_DIM + lane * ELEMS + e] * alpha;
+        }
+
+        // Write partial results for this split
+        const long out_offset = ((long)seq_idx * H_q + h_q) * num_splits + split_id;
+        if (lane == 0) {
+            partial_max[out_offset] = global_max;
+            partial_sum[out_offset] = global_sum;
+        }
+        float* po = partial_out + out_offset * HEAD_DIM + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            po[e] = final_acc[e];
+    }
+}
+
+// =============================================================================
+// Flash Decoding Split-K — Kernel 2: Reduce across splits
+// =============================================================================
+//
+// Grid:  (num_seqs, H_q)
+// Block: (32) — one warp
+//
+// Merges num_splits partial softmax results into final output.
+
+template<int HEAD_DIM>
+__global__ void flash_decode_reduce_kernel(
+    const float* __restrict__ partial_out,
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    half*        __restrict__ out,
+    int H_q,
+    int num_splits
+) {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be divisible by 32");
+    constexpr int ELEMS = HEAD_DIM / 32;
+
+    const int seq_idx = blockIdx.x;
+    const int h_q     = blockIdx.y;
+    const int lane    = threadIdx.x;
+
+    const long base = ((long)seq_idx * H_q + h_q) * num_splits;
+
+    // Find global max across splits
+    float global_max = -INFINITY;
+    for (int s = 0; s < num_splits; s++) {
+        float m = partial_max[base + s];
+        global_max = fmaxf(global_max, m);
+    }
+
+    // Merge: rescale each split's partial and accumulate
+    float global_sum = 0.0f;
+    float acc[ELEMS];
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++) acc[e] = 0.0f;
+
+    for (int s = 0; s < num_splits; s++) {
+        const float alpha = expf(partial_max[base + s] - global_max);
+        global_sum += partial_sum[base + s] * alpha;
+
+        const float* po = partial_out + (base + s) * HEAD_DIM + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            acc[e] += po[e] * alpha;
+    }
+
+    // Normalize and write final output
+    const float inv = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+    half* out_ptr = out + (seq_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++)
+        out_ptr[e] = __float2half(acc[e] * inv);
+}
+
+// =============================================================================
 // FA2 Backward — Kernel 1: Precompute D  (unchanged)
 // =============================================================================
 
@@ -1171,6 +1387,45 @@ void launch_paged_attention_decode(
         q, k_cache, v_cache, out,
         block_tables, seq_lens,
         scale, max_blocks_per_seq, H_q, H_kv
+    );
+}
+
+void launch_flash_decode_splitk(
+    const half*  q,
+    const half*  k_cache,
+    const half*  v_cache,
+    half*        out,
+    float*       partial_out,
+    float*       partial_max,
+    float*       partial_sum,
+    const int*   block_tables,
+    const int*   seq_lens,
+    int num_seqs, int H_q, int H_kv, int head_dim,
+    int max_blocks_per_seq, int block_size,
+    int num_splits,
+    cudaStream_t stream
+) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    constexpr int NUM_WARPS = 4;
+    dim3 grid_k1(num_seqs, H_q, num_splits);
+    dim3 block_k1(32 * NUM_WARPS);
+    size_t smem = (2 * NUM_WARPS + NUM_WARPS * 128) * sizeof(float);
+
+    flash_decode_splitk_kernel<128, 16, NUM_WARPS><<<grid_k1, block_k1, smem, stream>>>(
+        q, k_cache, v_cache,
+        partial_out, partial_max, partial_sum,
+        block_tables, seq_lens,
+        scale, max_blocks_per_seq, H_q, H_kv, num_splits
+    );
+
+    // Kernel 2: reduce across splits
+    dim3 grid_k2(num_seqs, H_q);
+    dim3 block_k2(32);
+
+    flash_decode_reduce_kernel<128><<<grid_k2, block_k2, 0, stream>>>(
+        partial_out, partial_max, partial_sum,
+        out, H_q, num_splits
     );
 }
 

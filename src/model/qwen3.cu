@@ -283,14 +283,34 @@ void qwen3_layer_forward(
         const half* k_layer = m->kv_cache.k_pool + layer_idx * layer_stride;
         const half* v_layer = m->kv_cache.v_pool + layer_idx * layer_stride;
 
-        launch_paged_attention_decode(
-            m->d_Q,
-            k_layer, v_layer,
-            m->d_attn_out,
-            m->kv_cache.block_tables, m->kv_cache.seq_lens,
-            B, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
-            m->kv_cache.max_blocks_per_seq, KV_BLOCK_SIZE,
-            stream);
+        // Split-K helps when B*H_q is small (GPU starved for blocks).
+        // At large batches the original warp-parallel kernel is faster.
+        const int total_heads = B * c.num_attention_heads;
+        int num_splits = 1;
+        if (total_heads <= 32)        num_splits = 16;
+        else if (total_heads <= 128)  num_splits = 8;
+        num_splits = min(num_splits, m->splitk_max_splits);
+
+        if (num_splits > 1) {
+            launch_flash_decode_splitk(
+                m->d_Q,
+                k_layer, v_layer,
+                m->d_attn_out,
+                m->d_splitk_out, m->d_splitk_max, m->d_splitk_sum,
+                m->kv_cache.block_tables, m->kv_cache.seq_lens,
+                B, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                m->kv_cache.max_blocks_per_seq, KV_BLOCK_SIZE,
+                num_splits, stream);
+        } else {
+            launch_paged_attention_decode(
+                m->d_Q,
+                k_layer, v_layer,
+                m->d_attn_out,
+                m->kv_cache.block_tables, m->kv_cache.seq_lens,
+                B, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                m->kv_cache.max_blocks_per_seq, KV_BLOCK_SIZE,
+                stream);
+        }
     }
 
     // O projection + residual
@@ -426,6 +446,17 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_slot_map, (long)max_T * sizeof(int64_t)));
 
+    // Flash Decoding split-K workspace
+    {
+        const int max_splits = 16;
+        const long ws_out = (long)max_batch * c.num_attention_heads * max_splits * c.head_dim;
+        const long ws_ms  = (long)max_batch * c.num_attention_heads * max_splits;
+        CUDA_CHECK(cudaMalloc(&m->d_splitk_out, ws_out * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&m->d_splitk_max, ws_ms  * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&m->d_splitk_sum, ws_ms  * sizeof(float)));
+        m->splitk_max_splits = max_splits;
+    }
+
     int total_blocks = num_kv_blocks;
     int max_blocks_per_seq = (max_seq + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE + 2;
 
@@ -507,6 +538,7 @@ void qwen3_free(Qwen3Model* m) {
     cudaFree(m->d_mlp_mid);   cudaFree(m->d_logits);
     cudaFree(m->d_pos_ids);   cudaFree(m->d_slot_map);
     cudaFree(m->d_tokens);
+    cudaFree(m->d_splitk_out); cudaFree(m->d_splitk_max); cudaFree(m->d_splitk_sum);
     cudaFreeHost(m->h_block_tables);
     cudaFreeHost(m->h_seq_lens);
     cudaFreeHost(m->h_slot_map);
