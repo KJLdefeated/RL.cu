@@ -324,9 +324,9 @@ static void test_bench_realistic(LLMEngine& engine) {
     };
     auto rng = make_lcg(0);
 
-    const int NUM_SEQS      = 64;
-    const int MAX_INPUT_LEN = 4096;
-    const int MAX_OUT_LEN   = 4096;
+    const int NUM_SEQS      = 128;
+    const int MAX_INPUT_LEN = 2048;
+    const int MAX_OUT_LEN   = 2048;
 
     std::vector<std::vector<int64_t>> prompts(NUM_SEQS);
     std::vector<SamplingParams>       sps(NUM_SEQS);
@@ -602,7 +602,7 @@ int main(int argc, char* argv[]) {
     }
 
     Config cfg(model_dir);
-    cfg.max_num_seqs           = 64;
+    cfg.max_num_seqs           = 256;
     cfg.max_model_len          = 8192;
     cfg.gpu_memory_utilization = 0.90f;
     cfg.enforce_eager          = false;

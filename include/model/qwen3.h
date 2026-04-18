@@ -54,6 +54,12 @@ struct Qwen3Model {
     half*    d_up        = nullptr;  // [max_T, intermediate_size]
     half*    d_mlp_mid   = nullptr;  // [max_T, intermediate_size]
     half*    d_logits    = nullptr;  // [max_batch, vocab_size]
+
+    // Flash Decoding split-K workspace
+    float*   d_splitk_out = nullptr;  // [max_batch * H_q * max_splits * head_dim]
+    float*   d_splitk_max = nullptr;  // [max_batch * H_q * max_splits]
+    float*   d_splitk_sum = nullptr;  // [max_batch * H_q * max_splits]
+    int      splitk_max_splits = 0;
     int*     d_pos_ids   = nullptr;  // [max_T]
     int*     d_tokens    = nullptr;  // [max_T]
     int64_t* d_slot_map  = nullptr;  // [max_T]

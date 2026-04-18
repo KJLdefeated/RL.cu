@@ -42,3 +42,24 @@ void launch_paged_attention_decode(
     int max_blocks_per_seq, int block_size,
     cudaStream_t stream = 0
 );
+
+// Flash Decoding with Split-K: splits KV context across multiple thread blocks
+// for higher GPU occupancy on long sequences.
+// Workspace: partial_out [num_seqs * H_q * num_splits * head_dim] floats
+//            partial_max [num_seqs * H_q * num_splits] floats
+//            partial_sum [num_seqs * H_q * num_splits] floats
+void launch_flash_decode_splitk(
+    const half*  q,
+    const half*  k_cache,
+    const half*  v_cache,
+    half*        out,
+    float*       partial_out,    // workspace
+    float*       partial_max,    // workspace
+    float*       partial_sum,    // workspace
+    const int*   block_tables,
+    const int*   seq_lens,
+    int num_seqs, int H_q, int H_kv, int head_dim,
+    int max_blocks_per_seq, int block_size,
+    int num_splits,
+    cudaStream_t stream = 0
+);
