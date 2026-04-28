@@ -54,6 +54,14 @@ A from-scratch implementation of the complete LLM RL pipeline — hand-written C
 ```bash
 git clone https://github.com/KJLdefeated/RL.cu.git && cd RL.cu
 
+# Fetch third-party headers and CUTLASS (see "Third-party dependencies" below)
+mkdir -p include/third_party third_party
+curl -L -o include/third_party/json.hpp \
+    https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+curl -L -o include/third_party/xxhash.h \
+    https://raw.githubusercontent.com/Cyan4973/xxHash/v0.8.1/xxhash.h
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git third_party/cutlass
+
 # Download model weights
 pip install huggingface_hub
 python scripts/download_model.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
@@ -64,6 +72,18 @@ make
 # Or build a specific target
 make build/test_llmengine
 ```
+
+### Third-party dependencies
+
+These are header-only / source dependencies that aren't checked into the repo (they're in `.gitignore`). Drop them at the paths shown — that's where `#include "third_party/..."` and CMakeLists.txt expect to find them.
+
+| Library | Version used | Path | Source |
+|---------|--------------|------|--------|
+| nlohmann/json | 3.11.3 | `include/third_party/json.hpp` | https://github.com/nlohmann/json |
+| xxHash | 0.8.1 | `include/third_party/xxhash.h` | https://github.com/Cyan4973/xxHash |
+| NVIDIA CUTLASS | main (header-only includes) | `third_party/cutlass/` | https://github.com/NVIDIA/cutlass |
+
+The `curl`/`git clone` commands in the Build block above fetch all three. CUTLASS is large (~250 MB); `--depth 1` keeps the clone shallow.
 
 ### Makefile Commands
 
