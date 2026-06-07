@@ -49,6 +49,85 @@ public:
         scheduler->add(new Sequence(seq_id_counter++, token_ids, sampling_params));
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Agentic multi-turn rollout API (docs/AGENTIC_ROLLOUT_SPEC.md §2)
+    //
+    // Lifecycle: rollout_add → step()s pause at EOS / max_new (KV retained)
+    //           ↳ rollout_continue(obs_tokens) → step()s pause again
+    //           ↳ ... ↳ rollout_finish() frees KV + batch slot.
+    //
+    // rollout_run_turns() drives step() until every active sequence has paused
+    // (turn-end) or finished.  Cross-turn KV reuse: continued prefill processes
+    // only the new observation span, attending over the cached prefix.
+    // ────────────────────────────────────────────────────────────────────────
+    struct TurnOutput {
+        std::vector<int64_t> new_tokens;  // tokens emitted THIS turn
+        int  turn_idx   = 0;
+        bool hit_eos    = false;          // ended on EOS → episode may continue
+        bool truncated  = false;          // ended on max_new_tokens
+    };
+
+    int64_t rollout_add(const std::vector<int64_t>& prompt_tokens,
+                        SamplingParams sp) {
+        sp.agentic = true;                  // turn-end pauses (KV retained)
+        int64_t sid = seq_id_counter++;
+        scheduler->add(new Sequence(sid, prompt_tokens, sp));
+        return sid;
+    }
+
+    // Resume a paused agentic episode by appending observation tokens.
+    // The next assistant turn will continue-prefill over the cached prefix.
+    void rollout_continue(int64_t seq_id, const std::vector<int64_t>& obs_tokens) {
+        Sequence* seq = scheduler->take_paused(seq_id);
+        if (!seq) return;                   // unknown / already finalized
+        scheduler->resume(seq, obs_tokens);
+    }
+
+    // Drive step() until every active episode has paused (turn-end) or finished.
+    // Returns per-seq_id the tokens emitted *this* turn for episodes that just
+    // transitioned to PAUSED.
+    std::map<int64_t, TurnOutput> rollout_run_turns() {
+        // Snapshot the episodes alive at the start of this turn-batch.  Both
+        // running and freshly-resumed-in-waiting are this batch's responsibility;
+        // sequences already in paused_ before we start are not.
+        std::map<int64_t, int> turn_start;   // seq_id → next_turn_start (snapshot)
+        auto snapshot = [&](const std::deque<Sequence*>& q) {
+            for (Sequence* s : q) turn_start[s->seq_id] = s->next_turn_start;
+        };
+        snapshot(scheduler->waiting_view());
+        snapshot(scheduler->running_view());
+
+        // Run continuous batching until every active seq pauses or finishes.
+        while (!scheduler->no_active()) step();
+
+        std::map<int64_t, TurnOutput> out;
+        for (Sequence* s : scheduler->paused()) {
+            auto it = turn_start.find(s->seq_id);
+            if (it == turn_start.end()) continue;   // already-paused before this turn
+            TurnOutput t;
+            t.turn_idx = s->turn_count - 1;
+            t.new_tokens.assign(s->token_ids.begin() + it->second, s->token_ids.end());
+            int64_t last = t.new_tokens.empty() ? -1 : t.new_tokens.back();
+            t.hit_eos    = (last == config.eos);
+            t.truncated  = !t.hit_eos;
+            s->next_turn_start = s->size();   // mark turn collected
+            out.emplace(s->seq_id, std::move(t));
+        }
+        return out;
+    }
+
+    // Episode done: free KV + batch slot, drop the Sequence.
+    void rollout_finish(int64_t seq_id) {
+        Sequence* seq = scheduler->take_paused(seq_id);
+        if (!seq) return;
+        // Mirror Scheduler's finished-seq cleanup: free KV blocks + batch slot,
+        // then have the model release its slot state too.
+        scheduler->release_paused(seq);
+        if (model_runner && seq->batch_slot >= 0)
+            model_runner->free_seq_slot(seq->batch_slot);
+        delete seq;
+    }
+
     // Returns ({(seq_id, completion_token_ids), ...}, total_new_tokens)
     //
     // Two-phase continuous batching:

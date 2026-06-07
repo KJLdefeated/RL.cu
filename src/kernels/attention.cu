@@ -515,6 +515,168 @@ __global__ void paged_attention_decode_warp_kernel(
 }
 
 // =============================================================================
+// Paged Attention PREFILL Kernel (cache-reading, causal, continued prefill)
+// =============================================================================
+//
+// The S_q>1 sibling of the paged decode kernel.  Lets a tile of NEW-chunk query
+// rows attend over the paged KV cache (cached prefix + new chunk already written
+// via reshape_and_cache), causally by ABSOLUTE position.  This is what enables
+// "continued prefill": feed only a turn's new tokens and have them see the whole
+// history (docs/AGENTIC_ROLLOUT_SPEC.md).
+//
+// Each (query row, head) is one block of NUM_WARPS warps that split the query's
+// KV range [0, abs_pos] strided across warps — identical math to decode, but the
+// effective context length is abs_pos+1 instead of the full seq_len.  So it is
+// exactly "run paged decode once per new query with seq_len = abs_pos+1", which
+// the spike (test_chunked_prefill.cu, section C) verified reproduces full causal
+// attention.
+//
+// Grid:  (num_q, H_q)          — num_q = total new-chunk query rows across seqs
+// Block: (32 * NUM_WARPS)
+// Smem:  (2*NUM_WARPS + NUM_WARPS*HEAD_DIM) * sizeof(float)   (same as decode)
+//
+//   q          : [num_q, H_q, HEAD_DIM]  dense new-chunk queries
+//   out        : [num_q, H_q, HEAD_DIM]
+//   q_seq_idx  : [num_q]  which sequence each query row belongs to
+//   q_abs_pos  : [num_q]  absolute position of the query in its sequence;
+//                         < 0 marks a padding row (output zeroed, skipped)
+//   block_tables/k_cache/v_cache : same paged layout as decode
+template<int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void paged_attention_prefill_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    half*       __restrict__ out,
+    const int*  __restrict__ block_tables,
+    const int*  __restrict__ q_seq_idx,
+    const int*  __restrict__ q_abs_pos,
+    float scale,
+    int max_blocks_per_seq,
+    int H_q, int H_kv
+) {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be divisible by 32");
+    constexpr int ELEMS = HEAD_DIM / 32;
+
+    const int q_idx   = blockIdx.x;
+    const int h_q     = blockIdx.y;
+    const int lane    = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+    const int h_kv    = h_q * H_kv / H_q;
+
+    const int abs_pos = q_abs_pos[q_idx];
+
+    // Padding row → write zeros and exit (keeps output well-defined for callers
+    // that pad sequences to a uniform tile width).
+    if (abs_pos < 0) {
+        if (warp_id == 0) {
+            half* out_ptr = out + (q_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) out_ptr[e] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const int seq_idx     = q_seq_idx[q_idx];
+    const int context_len = abs_pos + 1;        // causal: attend to keys [0, abs_pos]
+    const int num_blocks  = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Load this query row into registers (same for all warps).
+    float q_reg[ELEMS];
+    {
+        const half* q_ptr = q + (q_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        const int2  raw   = *reinterpret_cast<const int2*>(q_ptr);
+        const float2 lo_f = __half22float2(*reinterpret_cast<const half2*>(&raw.x));
+        const float2 hi_f = __half22float2(*reinterpret_cast<const half2*>(&raw.y));
+        q_reg[0] = lo_f.x;  q_reg[1] = lo_f.y;
+        q_reg[2] = hi_f.x;  q_reg[3] = hi_f.y;
+    }
+
+    float warp_max = -INFINITY;
+    float warp_sum = 0.0f;
+    float warp_acc[ELEMS];
+    #pragma unroll
+    for (int d = 0; d < ELEMS; d++) warp_acc[d] = 0.0f;
+
+    const int* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Warp-strided over this query's KV blocks (blocks w, w+NW, w+2NW, ...).
+    for (int blk = warp_id; blk < num_blocks; blk += NUM_WARPS) {
+        const int physical_block  = seq_block_table[blk];
+        const int tokens_in_block = min(BLOCK_SIZE, context_len - blk * BLOCK_SIZE);
+        const long block_base =
+            ((long)physical_block * H_kv + h_kv) * BLOCK_SIZE * HEAD_DIM;
+
+        for (int tok = 0; tok < tokens_in_block; tok++) {
+            const half* k_ptr = k_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+            const half* v_ptr = v_cache + block_base + (long)tok * HEAD_DIM + lane * ELEMS;
+
+            const int2   k_raw = *reinterpret_cast<const int2*>(k_ptr);
+            const float2 k_lo  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.x));
+            const float2 k_hi  = __half22float2(*reinterpret_cast<const half2*>(&k_raw.y));
+
+            float partial = q_reg[0] * k_lo.x + q_reg[1] * k_lo.y
+                          + q_reg[2] * k_hi.x + q_reg[3] * k_hi.y;
+            #pragma unroll
+            for (int mask = 16; mask >= 1; mask >>= 1)
+                partial += __shfl_xor_sync(0xFFFFFFFF, partial, mask);
+            const float score = partial * scale;
+
+            const float new_max = fmaxf(warp_max, score);
+            const float alpha   = expf(warp_max - new_max);
+            const float p       = expf(score - new_max);
+            warp_sum = warp_sum * alpha + p;
+            warp_max = new_max;
+
+            const int2   v_raw = *reinterpret_cast<const int2*>(v_ptr);
+            const float2 v_lo  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.x));
+            const float2 v_hi  = __half22float2(*reinterpret_cast<const half2*>(&v_raw.y));
+            warp_acc[0] = warp_acc[0] * alpha + p * v_lo.x;
+            warp_acc[1] = warp_acc[1] * alpha + p * v_lo.y;
+            warp_acc[2] = warp_acc[2] * alpha + p * v_hi.x;
+            warp_acc[3] = warp_acc[3] * alpha + p * v_hi.y;
+        }
+    }
+
+    // Cross-warp merge (identical to decode kernel).
+    extern __shared__ float smem[];
+    float* smem_max = smem;
+    float* smem_sum = smem_max + NUM_WARPS;
+    float* smem_acc = smem_sum + NUM_WARPS;  // [NUM_WARPS][HEAD_DIM]
+
+    #pragma unroll
+    for (int e = 0; e < ELEMS; e++)
+        smem_acc[warp_id * HEAD_DIM + lane * ELEMS + e] = warp_acc[e];
+    if (lane == 0) { smem_max[warp_id] = warp_max; smem_sum[warp_id] = warp_sum; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float global_max = smem_max[0];
+        #pragma unroll
+        for (int w = 1; w < NUM_WARPS; w++)
+            global_max = fmaxf(global_max, smem_max[w]);
+
+        float global_sum = 0.0f;
+        float final_acc[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) final_acc[e] = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++) {
+            const float alpha = expf(smem_max[w] - global_max);
+            global_sum += smem_sum[w] * alpha;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                final_acc[e] += smem_acc[w * HEAD_DIM + lane * ELEMS + e] * alpha;
+        }
+
+        const float inv = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+        half* out_ptr = out + (q_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            out_ptr[e] = __float2half(final_acc[e] * inv);
+    }
+}
+
+// =============================================================================
 // Flash Decoding Split-K — Kernel 1: Partial Attention per Split
 // =============================================================================
 //
@@ -645,6 +807,23 @@ __global__ void flash_decode_splitk_kernel(
         for (int w = 1; w < NUM_WARPS; w++)
             global_max = fmaxf(global_max, smem_max[w]);
 
+        const long out_offset = ((long)seq_idx * H_q + h_q) * num_splits + split_id;
+        float* po = partial_out + out_offset * HEAD_DIM + lane * ELEMS;
+
+        // Empty split (no KV blocks in [split_start, split_end)): every warp
+        // contributes max=-inf. Writing the merge below would compute
+        // expf(-inf - (-inf)) = NaN, poisoning the reduce. Write neutral
+        // partials (sum=0, out=0) instead so the reduce skips this split.
+        if (global_max == -INFINITY) {
+            if (lane == 0) {
+                partial_max[out_offset] = -INFINITY;
+                partial_sum[out_offset] = 0.0f;
+            }
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++) po[e] = 0.0f;
+            return;
+        }
+
         float global_sum = 0.0f;
         float final_acc[ELEMS];
         #pragma unroll
@@ -660,12 +839,10 @@ __global__ void flash_decode_splitk_kernel(
         }
 
         // Write partial results for this split
-        const long out_offset = ((long)seq_idx * H_q + h_q) * num_splits + split_id;
         if (lane == 0) {
             partial_max[out_offset] = global_max;
             partial_sum[out_offset] = global_sum;
         }
-        float* po = partial_out + out_offset * HEAD_DIM + lane * ELEMS;
         #pragma unroll
         for (int e = 0; e < ELEMS; e++)
             po[e] = final_acc[e];
@@ -706,14 +883,27 @@ __global__ void flash_decode_reduce_kernel(
         global_max = fmaxf(global_max, m);
     }
 
-    // Merge: rescale each split's partial and accumulate
+    // All splits empty (context_len == 0): nothing to merge → zero output.
+    if (global_max == -INFINITY) {
+        half* out_ptr = out + (seq_idx * H_q + h_q) * HEAD_DIM + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) out_ptr[e] = __float2half(0.0f);
+        return;
+    }
+
+    // Merge: rescale each split's partial and accumulate.
+    // Skip empty splits (max == -inf) explicitly: their partial_out may be 0 but
+    // alpha would be expf(-inf - finite) = 0, and 0 * anything is fine — however
+    // guarding also avoids any NaN should an empty split ever carry one.
     float global_sum = 0.0f;
     float acc[ELEMS];
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.0f;
 
     for (int s = 0; s < num_splits; s++) {
-        const float alpha = expf(partial_max[base + s] - global_max);
+        const float pmax = partial_max[base + s];
+        if (pmax == -INFINITY) continue;          // empty split contributes nothing
+        const float alpha = expf(pmax - global_max);
         global_sum += partial_sum[base + s] * alpha;
 
         const float* po = partial_out + (base + s) * HEAD_DIM + lane * ELEMS;
@@ -1386,6 +1576,35 @@ void launch_paged_attention_decode(
     paged_attention_decode_warp_kernel<128, 16, NUM_WARPS><<<grid, block, smem, stream>>>(
         q, k_cache, v_cache, out,
         block_tables, seq_lens,
+        scale, max_blocks_per_seq, H_q, H_kv
+    );
+}
+
+void launch_flash_attention_prefill_paged(
+    const half*  q,
+    const half*  k_cache,
+    const half*  v_cache,
+    half*        out,
+    const int*   block_tables,
+    const int*   q_seq_idx,
+    const int*   q_abs_pos,
+    int num_q, int H_q, int H_kv, int head_dim,
+    int max_blocks_per_seq, int block_size,
+    cudaStream_t stream
+) {
+    if (num_q <= 0) return;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    // 8 warps per (query, head): split the query's KV range across warps, then
+    // merge with a shared-memory reduction — same shape as paged decode.
+    constexpr int NUM_WARPS = 8;
+    dim3 grid(num_q, H_q);
+    dim3 block(32 * NUM_WARPS);
+    size_t smem = (2 * NUM_WARPS + NUM_WARPS * 128) * sizeof(float);
+
+    paged_attention_prefill_kernel<128, 16, NUM_WARPS><<<grid, block, smem, stream>>>(
+        q, k_cache, v_cache, out,
+        block_tables, q_seq_idx, q_abs_pos,
         scale, max_blocks_per_seq, H_q, H_kv
     );
 }

@@ -64,12 +64,20 @@ struct Qwen3Model {
     int*     d_tokens    = nullptr;  // [max_T]
     int64_t* d_slot_map  = nullptr;  // [max_T]
 
+    // Continued (chunked) prefill: per-query-row metadata for the paged prefill
+    // attention kernel. Only populated when cont_prefill is set.
+    int*     d_q_seq_idx = nullptr;  // [max_T] batch slot owning each query row
+    int*     d_q_abs_pos = nullptr;  // [max_T] absolute position per query (<0 = pad)
+    bool     cont_prefill = false;   // current prefill reads paged KV (prefix + new chunk)
+
     // Host-side mirrors — all pinned (cudaMallocHost) for fast H2D cudaMemcpyAsync
     int*     h_block_tables        = nullptr;  // [max_batch × max_blocks_per_seq]
     int*     h_seq_lens            = nullptr;  // [max_batch]
     int64_t* h_slot_map            = nullptr;  // [max_T]
     int*     h_pos_ids             = nullptr;  // [max_T]
     int*     h_tokens              = nullptr;  // [max_T]  prefill+decode input tokens
+    int*     h_q_seq_idx           = nullptr;  // [max_T]  continued-prefill query→slot
+    int*     h_q_abs_pos           = nullptr;  // [max_T]  continued-prefill query abs pos
     int*     h_block_table_compact = nullptr;  // [max_batch × max_blocks_per_seq] decode compact
     int*     h_seq_lens_compact    = nullptr;  // [max_batch] decode compact
 
