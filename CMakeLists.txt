@@ -128,6 +128,12 @@ target_include_directories(test_dataloader PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(test_lr_scheduler tests/kernels/test_lr_scheduler.cpp)
 target_include_directories(test_lr_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+add_executable(test_cp_env tests/training/test_cp_env.cpp)
+target_include_directories(test_cp_env PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(test_cp_dataset tests/training/test_cp_dataset.cpp)
+target_include_directories(test_cp_dataset PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # test_loading_weights is C++ but includes cuda_fp16.h and calls cudaGetErrorString
 add_executable(test_loading_weights
     tests/kernels/test_loading_weights.cpp
