@@ -10,13 +10,18 @@ struct SamplingParams {
     int64_t top_k = 0;
     bool do_sample = true;
     bool ignore_eos = false;  // if true, never stop on EOS token (only on max_new_tokens)
+    // Agentic multi-turn rollout: when set, hitting EOS / max_new_tokens PAUSES
+    // the sequence (KV + batch slot retained) instead of finishing/deleting it.
+    // Caller drives turns via LLMEngine::rollout_continue / rollout_finish.
+    bool agentic = false;
 };
 
 // sequence status
 enum class SeqStatus : uint8_t {
     WAITING = 0,
     RUNNING = 1,
-    FINISHED = 2
+    FINISHED = 2,
+    PAUSED   = 3,   // agentic: turn ended, KV + batch_slot retained, awaiting resume
 };
 
 struct Sequence {
@@ -31,13 +36,21 @@ struct Sequence {
     SamplingParams sampling_params;
     std::vector<int64_t> token_ids;
     std::vector<int> block_table;
-    Sequence(int64_t seq_id, std::vector<int64_t> tok_ids, SamplingParams sampling_params) : 
+    // Agentic rollout bookkeeping: position where the current assistant turn's
+    // generation begins. Tokens [next_turn_start, size()) are this turn's emit.
+    int next_turn_start = 0;
+    int turn_count      = 0;
+    // Per-turn assistant spans, closed at each PAUSE.  Used by the trainer to
+    // build the loss mask (observation tokens excluded).
+    std::vector<std::pair<int,int>> asst_spans;
+    Sequence(int64_t seq_id, std::vector<int64_t> tok_ids, SamplingParams sampling_params) :
     seq_id(seq_id), token_ids(tok_ids), sampling_params(sampling_params)  {
         num_tokens = tok_ids.size();
         if (num_tokens > 0) {
             last_token_id = tok_ids.back();
         }
         num_prompt_tokens = num_tokens;
+        next_turn_start   = num_tokens;
     }
     int num_blocks() {
         return (token_ids.size() + block_size - 1) / block_size;

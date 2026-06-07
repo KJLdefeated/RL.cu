@@ -31,6 +31,26 @@ void launch_flash_attention_backward(
     cudaStream_t stream = 0
 );
 
+// Cache-reading causal prefill: new-chunk queries attend over the paged KV cache
+// (cached prefix + new chunk), causally by absolute position. Enables continued
+// (chunked) prefill for multi-turn rollouts. See src/kernels/attention.cu.
+//   q          : [num_q, H_q, head_dim]   dense new-chunk queries
+//   out        : [num_q, H_q, head_dim]
+//   q_seq_idx  : [num_q]  sequence index per query row
+//   q_abs_pos  : [num_q]  absolute position per query row (<0 = padding → zeroed)
+void launch_flash_attention_prefill_paged(
+    const half*  q,
+    const half*  k_cache,
+    const half*  v_cache,
+    half*        out,
+    const int*   block_tables,
+    const int*   q_seq_idx,
+    const int*   q_abs_pos,
+    int num_q, int H_q, int H_kv, int head_dim,
+    int max_blocks_per_seq, int block_size,
+    cudaStream_t stream = 0
+);
+
 void launch_paged_attention_decode(
     const half*  q,
     const half*  k_cache,

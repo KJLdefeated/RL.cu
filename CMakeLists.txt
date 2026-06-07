@@ -95,6 +95,7 @@ add_kernel_test(test_rmsnorm           tests/kernels/test_rmsnorm.cu)
 add_kernel_test(test_softmax           tests/kernels/test_softmax.cu)
 add_kernel_test(test_swiglu            tests/kernels/test_swiglu.cu)
 add_kernel_test(test_attention         tests/kernels/test_attention.cu)
+add_kernel_test(test_chunked_prefill   tests/kernels/test_chunked_prefill.cu)
 add_kernel_test(test_rope              tests/kernels/test_rope.cu)
 add_kernel_test(test_embedding         tests/kernels/test_embedding.cu)
 add_kernel_test(test_linear            tests/kernels/test_linear.cu)
@@ -117,6 +118,8 @@ add_kernel_test(test_attention_backward tests/kernels/test_attention_backward.cu
 # add_model_test(test_qwen3_forward      tests/models/test_qwen3_forward.cu)
 add_model_test(test_qwen3_backward     tests/models/test_qwen3_backward.cu)
 add_model_test(test_llmengine          tests/models/test_llmengine.cu)
+add_model_test(test_continued_prefill_model tests/models/test_continued_prefill_model.cu)
+add_model_test(test_rollout_engine     tests/models/test_rollout_engine.cu)
 
 # ── C++-only tests (tests/kernels/) ─────────────────────────────────────────
 add_executable(test_dataloader tests/kernels/test_dataloader.cpp)

@@ -269,7 +269,21 @@ void qwen3_layer_forward(
     // Append K/V to paged KV cache
     launch_reshape_and_cache_half(m->d_K, m->d_V,m->kv_cache.k_pool, m->kv_cache.v_pool,m->d_slot_map,T, layer_idx,m->kv_cache.total_blocks, c.num_key_value_heads, c.head_dim,stream);
 
-    if (is_prefill) {
+    if (is_prefill && m->cont_prefill) {
+        // Continued (chunked) prefill: the new-chunk queries (m->d_Q) attend over
+        // the paged KV cache (cached prefix + the chunk just written above),
+        // causally by absolute position. Per-query metadata (slot, abs pos) was
+        // uploaded in qwen3_prefill; padding rows carry q_abs_pos < 0.
+        const size_t layer_stride = (size_t)m->kv_cache.total_blocks
+                                  * c.num_key_value_heads * KV_BLOCK_SIZE * c.head_dim;
+        const half* k_layer = m->kv_cache.k_pool + layer_idx * layer_stride;
+        const half* v_layer = m->kv_cache.v_pool + layer_idx * layer_stride;
+        launch_flash_attention_prefill_paged(
+            m->d_Q, k_layer, v_layer, m->d_attn_out,
+            m->kv_cache.block_tables, m->d_q_seq_idx, m->d_q_abs_pos,
+            T, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+            m->kv_cache.max_blocks_per_seq, KV_BLOCK_SIZE, stream);
+    } else if (is_prefill) {
         // FA2 prefill — uses live K, V just computed above.
         launch_flash_attention_prefill(
             m->d_Q, m->d_K, m->d_V, m->d_attn_out,
@@ -390,6 +404,8 @@ Qwen3Model* qwen3_load(const std::string& model_dir, int max_batch, int max_seq)
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_slot_map, (long)max_T * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&m->d_q_seq_idx, (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&m->d_q_abs_pos, (long)max_T * sizeof(int)));
 
     // Host mirrors — pinned for fast H2D cudaMemcpyAsync
     int mbps = m->kv_cache.max_blocks_per_seq;
@@ -398,6 +414,8 @@ Qwen3Model* qwen3_load(const std::string& model_dir, int max_batch, int max_seq)
     CUDA_CHECK(cudaMallocHost(&m->h_slot_map,     (long)max_T * sizeof(int64_t)));
     CUDA_CHECK(cudaMallocHost(&m->h_pos_ids,      (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_tokens,       (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_q_seq_idx,    (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_q_abs_pos,    (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_block_table_compact, (long)max_batch * mbps * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_seq_lens_compact,    max_batch * sizeof(int)));
     memset(m->h_block_tables, -1, (long)max_batch * mbps * sizeof(int));
@@ -445,6 +463,8 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
     CUDA_CHECK(cudaMalloc(&m->d_tokens,   (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_pos_ids,  (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&m->d_slot_map, (long)max_T * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&m->d_q_seq_idx, (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&m->d_q_abs_pos, (long)max_T * sizeof(int)));
 
     // Flash Decoding split-K workspace
     {
@@ -483,6 +503,8 @@ void qwen3_init(Qwen3Model* m, int max_batch, int max_seq,
     CUDA_CHECK(cudaMallocHost(&m->h_slot_map,     (long)max_T * sizeof(int64_t)));
     CUDA_CHECK(cudaMallocHost(&m->h_pos_ids,      (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_tokens,       (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_q_seq_idx,    (long)max_T * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&m->h_q_abs_pos,    (long)max_T * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_block_table_compact, (long)max_batch * mbps * sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&m->h_seq_lens_compact,    max_batch * sizeof(int)));
     memset(m->h_block_tables, -1, (long)max_batch * mbps * sizeof(int));
@@ -538,12 +560,15 @@ void qwen3_free(Qwen3Model* m) {
     cudaFree(m->d_mlp_mid);   cudaFree(m->d_logits);
     cudaFree(m->d_pos_ids);   cudaFree(m->d_slot_map);
     cudaFree(m->d_tokens);
+    cudaFree(m->d_q_seq_idx); cudaFree(m->d_q_abs_pos);
     cudaFree(m->d_splitk_out); cudaFree(m->d_splitk_max); cudaFree(m->d_splitk_sum);
     cudaFreeHost(m->h_block_tables);
     cudaFreeHost(m->h_seq_lens);
     cudaFreeHost(m->h_slot_map);
     cudaFreeHost(m->h_pos_ids);
     cudaFreeHost(m->h_tokens);
+    cudaFreeHost(m->h_q_seq_idx);
+    cudaFreeHost(m->h_q_abs_pos);
     cudaFreeHost(m->h_block_table_compact);
     cudaFreeHost(m->h_seq_lens_compact);
     delete m;
@@ -623,16 +648,21 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
     // Collect per-sequence tokens; pad to max length so the batch is uniform.
     int mbps = m->kv_cache.max_blocks_per_seq;
     std::vector<int> actual_lens(B);
-    int S = 0;  // max sequence length (for padding)
+    int S = 0;            // max chunk length (for padding)
+    bool is_continued = false;  // any seq resuming with a cached prefix
     for (int b = 0; b < B; b++) {
         const Sequence* seq = batch[b];
         int start = seq->num_cached_tokens;
         int end   = seq->num_tokens;
         actual_lens[b] = end - start;
         if (actual_lens[b] > S) S = actual_lens[b];
+        if (start > 0) is_continued = true;
     }
 
-    // Build token/position/slot arrays directly into pinned buffers
+    // Build token/position/slot arrays directly into pinned buffers.
+    // For continued prefill we also record, per query row, the owning batch slot
+    // and the absolute position (or -1 for padding) so the paged prefill kernel
+    // can attend over the cached prefix + new chunk.
     int t = 0;
     for (int b = 0; b < B; b++) {
         const Sequence* seq = batch[b];
@@ -649,12 +679,16 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
             m->h_tokens[t]   = (int)seq->token_ids[i];
             m->h_pos_ids[t]  = i;
             m->h_slot_map[t] = paged_kv_cache_append_slot(m->kv_cache, m->h_block_tables, m->h_seq_lens, slot);
+            m->h_q_seq_idx[t] = slot;
+            m->h_q_abs_pos[t] = i;
         }
         // Pad shorter sequences to S; padding slots = -1 → KV write is skipped.
         for (int p = actual_lens[b]; p < S; p++, t++) {
             m->h_tokens[t]   = 0;
             m->h_pos_ids[t]  = 0;
             m->h_slot_map[t] = -1LL;
+            m->h_q_seq_idx[t] = slot;
+            m->h_q_abs_pos[t] = -1;   // padding → paged kernel zeroes the row
         }
     }
 
@@ -666,10 +700,25 @@ half* qwen3_prefill(Qwen3Model* m, const std::vector<Sequence*>& batch,
     CUDA_CHECK(cudaMemcpyAsync(m->d_slot_map, m->h_slot_map, T * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.seq_lens, m->h_seq_lens, m->max_batch * sizeof(int), cudaMemcpyHostToDevice, stream));
 
+    // Continued prefill: hand the paged attention kernel the full per-slot block
+    // table and per-query metadata, and flip the path flag for the layer loop.
+    m->cont_prefill = is_continued;
+    if (is_continued) {
+        CUDA_CHECK(cudaMemcpyAsync(m->kv_cache.block_tables, m->h_block_tables,
+                                   (long)m->max_batch * mbps * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(m->d_q_seq_idx, m->h_q_seq_idx, T * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(m->d_q_abs_pos, m->h_q_abs_pos, T * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+    }
+
     launch_embedding(m->d_hidden, m->weights.embed_tokens, m->d_tokens, T, c.vocab_size, c.hidden_size, stream);
 
     for (int l = 0; l < c.num_hidden_layers; l++)
         qwen3_layer_forward(m, l, T, B, S, true, stream);
+
+    m->cont_prefill = false;
 
     // Gather the last *real* token of each sequence (padding may make sequences unequal in len).
     // Reuse d_tokens as a temporary int[B] buffer for offsets; h_tokens is pinned.

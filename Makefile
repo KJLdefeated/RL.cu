@@ -41,6 +41,7 @@ $(BUILDDIR)/%: configure
 # ── Test targets (build + run) ────────────────────────────────────────────────
 
 KERNEL_TESTS := test_rmsnorm test_softmax test_swiglu test_attention \
+                test_chunked_prefill \
                 test_rope test_embedding test_linear test_sampler \
                 test_fused_norm_linear test_kv_cache test_adamw test_fwd_bwd
 
@@ -48,7 +49,7 @@ BACKWARD_TESTS := test_linear_backward test_embedding_backward \
                   test_rmsnorm_backward test_swiglu_backward \
                   test_rope_backward test_attention_backward
 
-MODEL_TESTS := test_qwen3_backward test_llmengine
+MODEL_TESTS := test_qwen3_backward test_llmengine test_continued_prefill_model test_rollout_engine
 
 CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights
 

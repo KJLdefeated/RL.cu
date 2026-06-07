@@ -292,9 +292,9 @@ static void test_throughput(LLMEngine& engine) {
            "batch", "tok/s", "ms/request", "output_tokens");
 
     BenchResult best{};
-    for (int batch : {256}) {
+    for (int batch : {1, 8, 16, 32, 64}) {
         if (batch > engine.config.max_num_seqs) break;
-        auto res = run_bench(engine, batch, 1024);
+        auto res = run_bench(engine, batch, 256);
         printf("  %6d  %10.0f  %12.1f  %12d\n",
                batch, res.toks_per_sec(), res.ms_per_req(), res.num_output_tokens);
         if (res.toks_per_sec() > best.toks_per_sec()) best = res;
@@ -613,7 +613,7 @@ int main(int argc, char* argv[]) {
     // test_correctness(engine);
     // test_memory(engine);
     // test_throughput(engine);
-    test_bench_realistic(engine);
+    test_bench_realistic(engine);   // needs data/dapo-17k.bin
 
     printf("\n");
     if (g_fail == 0)

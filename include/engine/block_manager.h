@@ -145,4 +145,32 @@ public:
     }
 
     int num_free_blocks() const { return (int)free_block_ids.size(); }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Agentic-rollout resume support
+    // ────────────────────────────────────────────────────────────────────────
+    // Number of additional blocks needed so seq.block_table covers ceil(size/block_size).
+    // Returns 0 when nothing is missing (e.g. obs landed inside the partial tail block).
+    int blocks_needed_for(Sequence& seq) const {
+        int target = (seq.size() + block_size - 1) / block_size;
+        int have   = (int)seq.block_table.size();
+        return target > have ? target - have : 0;
+    }
+
+    bool can_append_blocks(Sequence& seq) const {
+        return (int)free_block_ids.size() >= blocks_needed_for(seq);
+    }
+
+    // Extend seq.block_table to cover the current size, allocating only the delta
+    // (not the prefix blocks the sequence already holds). Used by schedule_prefill
+    // when resuming a paused agentic sequence whose KV prefix is still resident.
+    void append_blocks_for(Sequence& seq) {
+        int need = blocks_needed_for(seq);
+        for (int i = 0; i < need; ++i) {
+            int block_id = free_block_ids.front();
+            free_block_ids.pop_front();
+            _allocate_block(block_id);
+            seq.block_table.push_back(block_id);
+        }
+    }
 };
