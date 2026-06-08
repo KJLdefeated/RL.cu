@@ -51,7 +51,7 @@ BACKWARD_TESTS := test_linear_backward test_embedding_backward \
 
 MODEL_TESTS := test_qwen3_backward test_llmengine test_continued_prefill_model test_rollout_engine
 
-CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights
+CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights test_cp_env test_cp_dataset
 
 ALL_TESTS := $(KERNEL_TESTS) $(BACKWARD_TESTS) $(MODEL_TESTS) $(CPP_TESTS)
 

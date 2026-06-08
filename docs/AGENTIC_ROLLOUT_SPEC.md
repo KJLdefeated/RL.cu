@@ -15,8 +15,9 @@ loop into a multi-turn, execution-grounded rollout with cross-turn KV reuse, on
 | Stage 2 wiring — `qwen3_prefill` continued-prefill path | ✅ done — routes to the paged kernel when any seq has `num_cached_tokens>0` ([test_continued_prefill_model.cu](../tests/models/test_continued_prefill_model.cu)) |
 | Engine resume API — `PAUSED`/`rollout_*`, scheduler resume + continued-prefill scheduling, `BlockManager::append_blocks_for` | ✅ done — multi-turn rollout via engine == single-shot reference token-for-token through 12 decode steps ([test_rollout_engine.cu](../tests/models/test_rollout_engine.cu)) |
 | **Prerequisite bug fix** — Flash-Decode split-K NaN (see below) | ✅ done — was blocking 100% of generation on this box |
-| Trainer rewrite (`Episode`, rollout driver, obs masking) | ⬜ not started (§3) |
-| CP env + sandbox | ⬜ not started (§2 env, §3.4) |
+| CP env + sandboxed Python runner — `Env` / `CodeContestsEnv` / `extract_code` ([env.h](../include/training/env.h)) + `SubprocessPythonRunner` w/ setrlimit + unshare net ([code_runner.h](../include/training/code_runner.h)) | ✅ done — 16/16 tests pass: AllOrNothing + FractionPassed reward, sample-test feedback formatting, hard timeout, RLIMIT_AS, CLONE_NEWNET isolation verified on this box ([test_cp_env.cpp](../tests/training/test_cp_env.cpp)) |
+| Trainer rewrite (`Episode`, rollout driver, obs masking) | ⬜ not started (§3.1, 3.3, 3.5–3.8) |
+| CP dataset loader (CodeContests / TACO → `CPProblem` list) | ⬜ not started (gated on §6.2) |
 | Stage 3 — DP=2 | ⬜ not started |
 
 ### Prerequisite bug fixed: Flash-Decode split-K NaN (not part of the agentic spec, but blocked it)
@@ -367,8 +368,9 @@ not block on the kernel (Stage 0/2).
 | edit | `include/engine/block_manager.h` — `append_blocks_for` | ✅ done |
 | edit | `include/engine/llm_engine.h` — `rollout_*` API | ✅ done |
 | new  | `tests/models/test_rollout_engine.cu` — multi-turn rollout end-to-end | ✅ done |
-| new | `include/training/env.h` — `Env`, `CodeContestsEnv` | ⬜ |
-| new | `include/training/code_runner.h` — sandboxed `CodeRunner` | ⬜ |
+| new | `include/training/env.h` — `Env`, `CodeContestsEnv`, `extract_code` | ✅ done |
+| new | `include/training/code_runner.h` — `SubprocessPythonRunner` (sandbox) | ✅ done |
+| new | `tests/training/test_cp_env.cpp` — env + sandbox end-to-end | ✅ done |
 | edit | `include/training/GRPO_trainer.h` — `Episode`, `rollout`, reward, mask rewrite | ⬜ |
 | new | `tests/training/train_agentic_grpo.cu` — driver | ⬜ |
 | edit | `scripts/prepare_data.py` — `--mode code-rl` | ⬜ |
