@@ -64,7 +64,7 @@ git clone --depth 1 https://github.com/NVIDIA/cutlass.git third_party/cutlass
 
 # Download model weights
 pip install huggingface_hub
-python scripts/download_model.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
+python scripts/download.py Qwen/Qwen3-0.6B model_weights/Qwen3-0.6B
 
 # Build all targets (default: sm_120; override with ARCH=90 for H100, etc.)
 make
