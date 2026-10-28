@@ -293,6 +293,19 @@ RL.cu
 
 ## Tests
 
+GoogleTest and pytest provide framework-based test entry points. A first set of
+CPU tests can run without CUDA; Python tests use local fixtures without dataset
+downloads:
+
+```bash
+make test_cpu
+python -m pip install -r requirements-test.txt
+python -m pytest
+```
+
+See [tests/README.md](tests/README.md) for CTest selection, CUDA tests and
+GoogleTest dependency options.
+
 Tests are organized into three directories:
 
 | Directory | Contents |

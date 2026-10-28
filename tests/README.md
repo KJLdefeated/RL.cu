@@ -40,9 +40,73 @@ tests/
 
 ## Building & Running Tests
 
+### GoogleTest and CTest
+
+The learning-rate scheduler and RMSNorm forward tests use GoogleTest. Other C++
+and CUDA tests retain their standalone runners and are registered with CTest.
+GoogleTest 1.14+ is found with `find_package`; if unavailable, CMake downloads a
+pinned 1.14.0 source revision. For offline builds, supply `GTest_DIR` for an
+installed package or `FETCHCONTENT_SOURCE_DIR_GOOGLETEST` for a source checkout.
+
+Run the CPU-only GoogleTest suite without CUDA, model weights or third-party
+model headers:
+
 ```bash
-# Build and run all tests
+cmake -S . -B build/cpu -DRL_CU_BUILD_CUDA=OFF
+cmake --build build/cpu
+cmake -E chdir build/cpu ctest --output-on-failure
+# Equivalent: make test_cpu
+```
+
+Run the migrated CPU and CUDA suites (requires a CUDA toolkit and GPU):
+
+```bash
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120  # use your GPU architecture
+cmake --build build --target test_lr_scheduler test_rmsnorm
+cmake -E chdir build ctest -R 'LRSchedulerTest|RMSNormTest' --output-on-failure
+./build/test_rmsnorm --gtest_filter='*ZeroInput*'
+./build/test_rmsnorm --benchmark  # opt-in timing after correctness checks
+```
+
+RMSNorm checks the original model shapes plus small and non-aligned column
+counts against an FP32 reference using rounded FP16 input. It explicitly rejects
+NaN/Inf output and checks zero input. Without a CUDA device, its GoogleTest cases
+report a skip. CTest labels are `cpu`, `kernel` and `model`; model tests require
+the weights and other dependencies described in the root README. GPU tests
+share a CTest resource lock to avoid concurrent GPU workloads.
+
+After building all targets, select existing suites with
+`cmake -E chdir build ctest -L kernel --output-on-failure` or run all registered
+tests with `cmake -E chdir build ctest --output-on-failure`.
+Use `-DBUILD_TESTING=OFF` to build the training binaries without test targets or
+the GoogleTest dependency. This is an initial migration; the remaining standalone
+tests can be converted incrementally.
+
+### Python tests (offline)
+
+Python 3.10+ is required by the data preparation script's type annotations.
+Install the test dependencies, then run pytest from the repository root:
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest
+python -m pytest --junitxml=build/pytest-results.xml
+# Equivalent: make test_python PYTHON=python
+```
+
+The tests cover CodeContests extraction, public/hidden test mapping and caps,
+shard selection, and the CLI's filtering and UTF-8 JSONL output. Fixtures create
+small Parquet files in temporary directories; HuggingFace listing/download calls
+are replaced locally, so no network, model or GPU is needed.
+
+### Existing Makefile commands
+
+```bash
+# Build and run all tests (including backward and CPU tests; model weights required)
 make tests
+
+# Kernel forward + backward tests only
+make test_kernels
 
 # Build and run a single test
 make test_attention

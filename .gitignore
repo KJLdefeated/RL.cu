@@ -25,3 +25,8 @@ data/
 scripts/nano-vllm
 
 third_party/
+
+# Python tests
+__pycache__/
+.pytest_cache/
+.venv/

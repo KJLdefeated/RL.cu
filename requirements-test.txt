@@ -1,0 +1,3 @@
+pytest>=7,<10
+pyarrow>=12
+huggingface_hub>=0.20

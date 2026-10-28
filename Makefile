@@ -55,7 +55,7 @@ CPP_TESTS := test_dataloader test_lr_scheduler test_loading_weights test_cp_env 
 
 ALL_TESTS := $(KERNEL_TESTS) $(BACKWARD_TESTS) $(MODEL_TESTS) $(CPP_TESTS)
 
-.PHONY: tests $(ALL_TESTS) bench_decode train_sft train_grpo
+.PHONY: tests test_kernels test_cpu test_python $(ALL_TESTS) bench_decode train_sft train_grpo
 
 # Generic: "make test_foo" builds and runs ./build/test_foo
 $(ALL_TESTS): %: $(BUILDDIR)/%
@@ -70,7 +70,18 @@ train_sft: $(BUILDDIR)/train_sft
 train_grpo: $(BUILDDIR)/train_grpo
 	./$(BUILDDIR)/train_grpo
 
-tests: $(KERNEL_TESTS) $(MODEL_TESTS) test_loading_weights
+tests: $(ALL_TESTS)
+
+test_kernels: $(KERNEL_TESTS) $(BACKWARD_TESTS)
+
+# No CUDA toolkit, GPU, model weights or dataset downloads required.
+test_cpu:
+	cmake -S . -B $(BUILDDIR)/cpu -DRL_CU_BUILD_CUDA=OFF -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
+	cmake --build $(BUILDDIR)/cpu -j$(NPROC)
+	cmake -E chdir $(BUILDDIR)/cpu ctest --output-on-failure
+
+test_python:
+	$(PYTHON) -m pytest
 
 # ── Data preparation ─────────────────────────────────────────────────────────
 
